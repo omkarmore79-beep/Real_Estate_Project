@@ -1,0 +1,7 @@
+fastapi
+groq
+python-multipart
+python-dotenv
+streamlit
+uvicorn
+pymongo

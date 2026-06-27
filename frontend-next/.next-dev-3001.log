@@ -1,0 +1,16 @@
+
+> real-estate-document-admin@1.0.0 dev
+> next dev -p 3001
+
+  ▲ Next.js 14.2.35
+  - Local:        http://localhost:3001
+
+ ✓ Starting...
+ ✓ Ready in 3.4s
+ ○ Compiling /documents/upload ...
+ ✓ Compiled /documents/upload in 13.6s (558 modules)
+ GET /documents/upload 200 in 14491ms
+ ✓ Compiled in 937ms (286 modules)
+ ○ Compiling /api/upload ...
+ ✓ Compiled /api/upload in 7.3s (302 modules)
+ POST /api/upload 400 in 7546ms

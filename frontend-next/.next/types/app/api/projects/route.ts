@@ -1,4 +1,4 @@
-// File: C:\Users\ASUS\Desktop\real_estate_chatbot\frontend-next\src\app\api\projects\route.ts
+// File: C:\Users\vigne\Real_Estate_Project\frontend-next\src\app\api\projects\route.ts
 import * as entry from '../../../../../src/app/api/projects/route.js'
 import type { NextRequest } from 'next/server.js'
 

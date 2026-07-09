@@ -1,4 +1,4 @@
-// File: C:\Users\ASUS\Desktop\real_estate_chatbot\frontend-next\src\app\api\chat\route.ts
+// File: C:\Users\vigne\Real_Estate_Project\frontend-next\src\app\api\chat\route.ts
 import * as entry from '../../../../../src/app/api/chat/route.js'
 import type { NextRequest } from 'next/server.js'
 

@@ -1,7 +1,45 @@
+# ── FastAPI core ───────────────────────────────────────────────────────────────
 fastapi
-groq
+uvicorn[standard]
 python-multipart
 python-dotenv
-streamlit
-uvicorn
-pymongo
+
+# ── Database ───────────────────────────────────────────────────────────────────
+pymongo[srv]
+dnspython
+certifi
+python-dotenv
+qdrant-client[fastembed]
+
+
+
+# ── PDF & Image Processing & OCR ────────────────────────────────────────────────
+pymupdf
+pillow
+opencv-python-headless
+paddleocr
+paddlepaddle
+
+# ── Embeddings & Reranking ─────────────────────────────────────────────────────
+sentence-transformers
+FlagEmbedding
+transformers
+torch
+torchvision
+accelerate
+
+# ── Sparse / Keyword Search ────────────────────────────────────────────────────
+rank-bm25
+
+# ── Fuzzy Matching ─────────────────────────────────────────────────────────────
+rapidfuzz
+
+# ── LLM / API ─────────────────────────────────────────────────────────────────
+groq
+
+# ── Pydantic ───────────────────────────────────────────────────────────────────
+pydantic
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+numpy
+

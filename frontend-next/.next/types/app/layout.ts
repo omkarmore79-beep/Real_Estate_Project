@@ -1,4 +1,4 @@
-// File: C:\Users\ASUS\Desktop\real_estate_chatbot\frontend-next\src\app\layout.tsx
+// File: C:\Users\vigne\Real_Estate_Project\frontend-next\src\app\layout.tsx
 import * as entry from '../../../src/app/layout.js'
 import type { ResolvingMetadata, ResolvingViewport } from 'next/dist/lib/metadata/types/metadata-interface.js'
 

@@ -1,25 +1,33 @@
-from pdf2image import convert_from_path
-import fitz
-from ingestion.ocr_parser import extract_text_ocr_images
+"""
+Legacy text extractor — uses PyMuPDF only, NO OCR.
 
-POPPLER_PATH = r"C:\poppler\Library\bin"   # 🔴 update if your path differs
+This module is kept for backward compatibility with the LLM formatter
+(format_with_llm) which uses the extracted text to produce structured JSON.
+OCR has been completely removed. Pages with sparse text simply return
+whatever the PDF text layer contains (may be empty for image-only pages).
+
+For the RAG pipeline, use ingestion.pdf_processor.process_pdf() instead,
+which returns structured per-page output.
+"""
+
+import fitz  # PyMuPDF
 
 
-def extract_document(path):
+def extract_document(path: str) -> str:
+    """
+    Extract all text from a PDF using PyMuPDF's direct text layer.
+    No OCR. No external dependencies.
+
+    Returns a single string with page markers:
+        --- Page N (TEXT) ---
+        <page text>
+    """
     doc = fitz.open(path)
-
-    # ✅ Use poppler path explicitly
-    images = convert_from_path(path, poppler_path=POPPLER_PATH)
-
     final_text = ""
 
     for i, page in enumerate(doc):
         text = page.get_text().strip()
+        final_text += f"\n--- Page {i + 1} (TEXT) ---\n{text}"
 
-        if len(text) > 50:
-            final_text += f"\n--- Page {i+1} (TEXT) ---\n{text}"
-        else:
-            final_text += f"\n--- Page {i+1} (OCR) ---\n"
-            final_text += extract_text_ocr_images([images[i]])
-
+    doc.close()
     return final_text

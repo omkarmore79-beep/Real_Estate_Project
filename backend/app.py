@@ -156,6 +156,7 @@ async def upload_pdf(
     document_type: str | None = Form(default=None),
     description: str | None = Form(default=None),
     tags: str | None = Form(default=None),
+    domain: str = Form(default="real-estate"),
 ):
     """
     Upload a real-estate PDF.
@@ -250,6 +251,7 @@ async def upload_pdf(
         "document_type": document_type or "",
         "description": description or "",
         "tags": tags or "",
+        "domain": domain,
     }
     
     enqueue_document_processing(
@@ -336,9 +338,10 @@ async def chat(query: Any = Body(...)):
         document_id = query.get("document_id")
         include_images = bool(query.get("include_images", False))
         top_k = int(query.get("top_k", 8))
-        query = query.get("message") or query.get("query") or ""
+        domain = query.get("domain", "real-estate")
+        question = query.get("message") or query.get("query") or ""
 
-    question = str(query).strip()
+    question = str(question).strip()
     if not question:
         return {
             "question": "",
@@ -381,6 +384,7 @@ async def chat(query: Any = Body(...)):
         retrieved = retrieve(
             query=question,
             document_id=document_id,
+            domain=domain,
             include_images=include_images or intent.get("requires_visual_response", False),
             top_k=top_k,
         )
@@ -397,7 +401,7 @@ async def chat(query: Any = Body(...)):
         logger.warning("RAG pipeline failed, falling back to legacy path: %s", exc)
 
     # ── Legacy fallback ───────────────────────────────────────────────────────
-    projects = load_projects(document_id=document_id, include_raw_text=True)
+    projects = load_projects(document_id=document_id, domain=domain, include_raw_text=True)
     if not projects:
         return {
             "question": question,
@@ -491,13 +495,13 @@ async def delete_document(document_id: str):
 
 
 @app.get("/projects")
-async def projects():
-    return {"projects": load_projects()}
+async def projects(domain: str = "real-estate"):
+    return {"projects": load_projects(domain=domain)}
 
 
 @app.get("/builders")
-async def builders():
-    return {"builders": load_builders()}
+async def builders(domain: str = "real-estate"):
+    return {"builders": load_builders(domain=domain)}
 
 
 # ════════════════════════════════════════════════════════════════════════════════

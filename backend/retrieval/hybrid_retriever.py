@@ -82,6 +82,7 @@ def retrieve(
     project_name: str | None = None,
     builder: str | None = None,
     document_type: str | None = None,
+    domain: str | None = None,
     include_images: bool = False,
     top_k: int = 8,
 ) -> list[dict]:
@@ -122,6 +123,9 @@ def retrieve(
         text_filters["builder"] = builder
     if document_type:
         text_filters["document_type"] = document_type
+    if domain:
+        text_filters["domain"] = domain
+        image_filters["domain"] = domain
 
     # Detect intent
     image_intent = detect_image_intent(query)

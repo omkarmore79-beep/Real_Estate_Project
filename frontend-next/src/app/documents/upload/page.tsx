@@ -24,6 +24,7 @@ type ProcessingStatus =
   | "uploaded"
   | "extracting_text"
   | "extracting_images"
+  | "running_ocr"
   | "chunking"
   | "embedding_text"
   | "embedding_images"
@@ -289,12 +290,12 @@ export default function UploadDocumentPage() {
   return (
     <>
       <PageHeader
-        title="Upload document"
-        description="Upload a real estate PDF — the backend extracts text and images, creates embeddings, and indexes everything into Qdrant automatically."
+        title="Upload Document"
+        description="Upload technical manuals, project brochures, or documentation to the Knowledge Base."
       />
-      <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
+      <div className="mx-auto max-w-4xl">
         {/* ── Form ────────────────────────────────────────────────────── */}
-        <form onSubmit={handleSubmit} className="panel space-y-6 p-5">
+        <form onSubmit={handleSubmit} className="panel space-y-6 p-6 sm:p-8">
           {/* File drop zone */}
           <div className="rounded-lg border border-dashed bg-secondary/60 p-8 text-center">
             <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-md bg-white text-primary shadow-sm">
@@ -327,11 +328,11 @@ export default function UploadDocumentPage() {
           {/* Metadata fields */}
           <div className="grid gap-5 md:grid-cols-2">
             <label className="space-y-2">
-              <span className="label">Builder name</span>
+              <span className="label">Domain / Builder</span>
               <input
                 name="builder"
                 className="field"
-                placeholder="Builder or developer name"
+                placeholder="Manufacturer, Builder, or Category"
                 required
                 value={builderName}
                 onChange={(e) => setBuilderName(e.target.value)}
@@ -339,11 +340,11 @@ export default function UploadDocumentPage() {
               />
             </label>
             <label className="space-y-2">
-              <span className="label">Project name</span>
+              <span className="label">Model / Project</span>
               <input
                 name="project"
                 className="field"
-                placeholder="Mahavir Park, Golden Palms…"
+                placeholder="Excavator R215L, Mahavir Park..."
                 required
                 disabled={isActive}
               />
@@ -352,7 +353,7 @@ export default function UploadDocumentPage() {
               <span className="label">Document type</span>
               <select name="document_type" className="field" disabled={isActive}>
                 <option value="">What does this document contain?</option>
-                {["Brochure", "Floor plan", "Pricing", "RERA", "Amenities", "Location plan"].map(
+                {["Manual", "Diagram", "Brochure", "Floor plan", "Pricing", "Schematic"].map(
                   (t) => <option key={t}>{t}</option>,
                 )}
               </select>
@@ -548,95 +549,7 @@ export default function UploadDocumentPage() {
           </div>
         </form>
 
-        {/* ── Sidebar ─────────────────────────────────────────────────── */}
-        <aside className="space-y-4">
-          <div className="panel p-5">
-            <div className="flex items-start gap-3">
-              <Info className="mt-0.5 h-5 w-5 text-primary shrink-0" />
-              <div>
-                <h2 className="font-semibold">What happens on upload?</h2>
-                <ul className="mt-2 space-y-1.5 text-sm text-muted-foreground">
-                  <li className="flex gap-2">
-                    <FileText className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                    Text extracted per page (PyMuPDF, no OCR)
-                  </li>
-                  <li className="flex gap-2">
-                    <FileText className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                    Each page rendered as PNG image
-                  </li>
-                  <li className="flex gap-2">
-                    <Database className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                    Text chunks embedded with bge-m3
-                  </li>
-                  <li className="flex gap-2">
-                    <Database className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                    Images embedded with jina-clip-v2
-                  </li>
-                  <li className="flex gap-2">
-                    <Database className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                    Vectors stored in Qdrant
-                  </li>
-                  <li className="flex gap-2">
-                    <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                    Metadata saved to MongoDB
-                  </li>
-                </ul>
-                <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800">
-                  Embedding models download ~5 GB on first run. Subsequent runs
-                  use cached models and are much faster.
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div className="panel p-5">
-            <h2 className="font-semibold">Suggested tags</h2>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {[
-                "overview", "tower", "floor plan", "pricing",
-                "legal", "rera", "amenities", "payment",
-              ].map((tag) => (
-                <Badge key={tag}>{tag}</Badge>
-              ))}
-            </div>
-          </div>
-
-          <div className="panel p-5">
-            <h2 className="font-semibold">Processing pipeline</h2>
-            <div className="mt-3 space-y-1.5">
-              {PIPELINE_STEPS.map((step, i) => {
-                const done =
-                  isReady ||
-                  (currentStepIdx >= 0 && i < currentStepIdx);
-                const active = i === currentStepIdx && !isReady && !isFailed;
-                return (
-                  <div key={step.status} className="flex items-center gap-2 text-sm">
-                    <div
-                      className={`h-2 w-2 rounded-full shrink-0 ${
-                        done
-                          ? "bg-emerald-500"
-                          : active
-                          ? "bg-primary animate-pulse"
-                          : "bg-border"
-                      }`}
-                    />
-                    <span
-                      className={
-                        done
-                          ? "text-emerald-700"
-                          : active
-                          ? "font-medium text-foreground"
-                          : "text-muted-foreground"
-                      }
-                    >
-                      {step.label}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </aside>
+        {/* End Form */}
       </div>
     </>
   );

@@ -30,6 +30,7 @@ _IMAGE_INTENT_PHRASES = (
     "interior", "inside view", "room view",
     "parking plan", "parking layout",
     "show", "image", "photo", "picture", "display", "view", "layout",
+    "diagram", "schematic", "cross-section", "cross section", "blueprint", "circuit"
 )
 
 _IMAGE_TYPE_MAP = {
@@ -39,6 +40,7 @@ _IMAGE_TYPE_MAP = {
     "amenity": "amenity", "amenities": "amenity",
     "elevation": "exterior", "building view": "exterior",
     "exterior": "exterior", "interior": "interior",
+    "diagram": "diagram", "schematic": "diagram", "cross-section": "diagram"
 }
 
 # ── RRF constant ───────────────────────────────────────────────────────────────

@@ -442,9 +442,10 @@ def answer_from_project_data(question, projects):
 
 
 def generate_answer(prompt):
+    from config import LLM_MODEL
     try:
         response = _get_groq_client().chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=LLM_MODEL,
             messages=[
                 {
                     "role": "user",

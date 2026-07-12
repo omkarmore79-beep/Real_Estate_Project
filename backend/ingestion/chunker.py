@@ -1,6 +1,7 @@
 """
-Text Chunker for the Hybrid Multimodal RAG pipeline.
-Splits page-level text into overlapping chunks, preserves page-level OCR metadata,
+Semantic Chunker for the Hybrid Multimodal RAG pipeline.
+Splits page-level text into semantically cohesive chunks by analyzing the similarity
+between sentence embeddings. Preserves page-level OCR metadata, headings,
 and extracts real-estate-critical fields for downstream RAG retrieval.
 """
 
@@ -9,12 +10,15 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+import math
+from typing import Any
+from retrieval.embeddings import get_text_embedder
 
 logger = logging.getLogger(__name__)
 
-# Target chunk parameters (in words/tokens)
-CHUNK_SIZE_TOKENS = 600
-CHUNK_OVERLAP_TOKENS = 100
+# Target chunk size limits (in words)
+MIN_CHUNK_WORDS = 150
+MAX_CHUNK_WORDS = 800
 
 _SECTION_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("RERA", re.compile(r"\b(?:rera|maharera|registration\s+number)\b", re.IGNORECASE)),
@@ -42,13 +46,119 @@ _TAG_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("bhk", re.compile(r"\b\d\s*bhk\b", re.IGNORECASE)),
 ]
 
+def dot_product(v1: list[float], v2: list[float]) -> float:
+    return sum(x * y for x, y in zip(v1, v2))
+
+def norm(v: list[float]) -> float:
+    return math.sqrt(sum(x * x for x in v))
+
+def cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    n1, n2 = norm(v1), norm(v2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return dot_product(v1, v2) / (n1 * n2)
+
+def percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    k = (len(sorted_values) - 1) * p
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_values[int(k)]
+    d0 = sorted_values[int(f)] * (c - k)
+    d1 = sorted_values[int(c)] * (k - f)
+    return d0 + d1
+
+def split_into_sentences(text: str) -> list[str]:
+    """Split text into sentences using standard regex boundaries."""
+    # Matches . or ? or ! followed by space or newline, but ignores common abbreviations
+    sentence_end = re.compile(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s')
+    sentences = sentence_end.split(text)
+    return [s.strip() for s in sentences if s.strip()]
+
+def semantic_chunk_text(text: str, doc_id: str) -> list[str]:
+    """
+    Split text into semantically cohesive chunks.
+    Embeds individual sentences, computes similarity between consecutive sentences,
+    and splits where similarity drops below the threshold.
+    """
+    sentences = split_into_sentences(text)
+    if not sentences:
+        return []
+    if len(sentences) == 1:
+        return [sentences[0]]
+
+    # 1. Embed sentences in a single batch
+    try:
+        embedder = get_text_embedder()
+        embeddings = embedder.embed_batch(sentences)
+    except Exception as exc:
+        logger.warning("[%s] Failed to embed sentences for semantic chunking, falling back to word length splits: %s", doc_id, exc)
+        return _split_fallback(text)
+
+    # 2. Compute similarities between adjacent sentences
+    similarities = []
+    for i in range(len(sentences) - 1):
+        sim = cosine_similarity(embeddings[i], embeddings[i + 1])
+        similarities.append(sim)
+
+    # 3. Calculate threshold (e.g. 15th percentile of similarities)
+    # Splits will occur at local minima of similarity
+    threshold = percentile(similarities, 0.15) if similarities else 0.65
+    threshold = max(0.5, min(threshold, 0.85)) # Keep threshold in a reasonable range
+
+    chunks = []
+    current_sentences = []
+    current_word_count = 0
+
+    for idx, sentence in enumerate(sentences):
+        sentence_words = len(sentence.split())
+        current_sentences.append(sentence)
+        current_word_count += sentence_words
+
+        # Check split conditions
+        should_split = False
+        
+        # Condition A: Not the last sentence, and similarity is below threshold
+        if idx < len(sentences) - 1:
+            next_similarity = similarities[idx]
+            if next_similarity < threshold and current_word_count >= MIN_CHUNK_WORDS:
+                should_split = True
+
+        # Condition B: Word count exceeds maximum hard limit
+        if current_word_count >= MAX_CHUNK_WORDS:
+            should_split = True
+
+        if should_split:
+            chunks.append(" ".join(current_sentences).strip())
+            current_sentences = []
+            current_word_count = 0
+
+    if current_sentences:
+        chunks.append(" ".join(current_sentences).strip())
+
+    return chunks
+
+def _split_fallback(text: str) -> list[str]:
+    """Word-length chunk split fallback."""
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + 400, len(words))
+        chunks.append(" ".join(words[start:end]))
+        start += 300
+    return chunks
+
 def chunk_text_pages(
     pages: list[dict],
     document_id: str,
     metadata: dict | None = None,
 ) -> list[dict]:
     """
-    Chunk page dicts (containing text + OCR metadata) into overlapping RAG segments.
+    Chunk page dicts (containing text + OCR metadata) into overlapping semantic segments.
     """
     meta = metadata or {}
     chunks: list[dict] = []
@@ -70,62 +180,68 @@ def chunk_text_pages(
         else:
             source_type = "pdf_text"
 
-        page_chunks = _split_into_chunks(text)
+        page_chunks = semantic_chunk_text(text, document_id)
+        
         for chunk_index, chunk_text in enumerate(page_chunks):
             chunk_id = _make_chunk_id(document_id, page_number, chunk_index)
-            section_title = _detect_section(chunk_text)
-            tags = _extract_tags(chunk_text)
-            re_details = _extract_real_estate_details(chunk_text)
+            
+            if meta.get("domain") == "excavator":
+                chunk_metadata = {
+                    "doc_id": meta.get("doc_id", document_id),
+                    "document_id": document_id,
+                    "doc_type": meta.get("doc_type", ""),
+                    "title": meta.get("title", ""),
+                    "source_file": meta.get("source_file", ""),
+                    "revision_date": meta.get("revision_date", ""),
+                    "ingested_at": meta.get("ingested_at", ""),
+                    "page_number": page_number,
+                    "section_path": meta.get("section_path", ""),
+                    "machine_model": meta.get("machine_model", "R215L"),
+                    "component_tags": meta.get("component_tags", []),
+                    "dtc_codes": meta.get("dtc_codes", []),
+                    "supersedes_doc_id": meta.get("supersedes_doc_id", ""),
+                    "confidence_weight": meta.get("confidence_weight", 1.0),
+                    "domain": "excavator",
+                    "chunk_index": chunk_index,
+                    "source_type": source_type,
+                    "ocr_used": ocr_used,
+                    "ocr_confidence": ocr_confidence,
+                }
+            else:
+                section_title = _detect_section(chunk_text)
+                tags = _extract_tags(chunk_text)
+                re_details = _extract_real_estate_details(chunk_text)
+                chunk_metadata = {
+                    "document_id": document_id,
+                    "page_number": page_number,
+                    "project": meta.get("project_name", meta.get("project", "")),
+                    "builder": meta.get("builder", ""),
+                    "document_type": meta.get("document_type", ""),
+                    "source_file": meta.get("source_file", ""),
+                    "chunk_index": chunk_index,
+                    "section_title": section_title,
+                    "source_type": source_type,
+                    "ocr_used": ocr_used,
+                    "ocr_confidence": ocr_confidence,
+                    "tags": tags,
+                    **re_details,
+                }
 
             chunks.append(
                 {
                     "chunk_id": chunk_id,
                     "content": chunk_text,
                     "vector": [],  # filled by embedding service
-                    "metadata": {
-                        "document_id": document_id,
-                        "page_number": page_number,
-                        "project": meta.get("project_name", meta.get("project", "")),
-                        "builder": meta.get("builder", ""),
-                        "document_type": meta.get("document_type", ""),
-                        "source_file": meta.get("source_file", ""),
-                        "chunk_index": chunk_index,
-                        "section_title": section_title,
-                        "source_type": source_type,
-                        "ocr_used": ocr_used,
-                        "ocr_confidence": ocr_confidence,
-                        "tags": tags,
-                        **re_details,
-                    },
+                    "metadata": chunk_metadata,
                 }
             )
 
     logger.info(
-        "Created %d text chunks for document_id=%s across %d pages",
+        "Created %d semantic chunks for document_id=%s across %d pages",
         len(chunks),
         document_id,
         len(pages),
     )
-    return chunks
-
-def _split_into_chunks(text: str) -> list[str]:
-    """Split text into overlapping word-based chunks."""
-    words = text.split()
-    if not words:
-        return []
-
-    chunks: list[str] = []
-    start = 0
-
-    while start < len(words):
-        end = min(start + CHUNK_SIZE_TOKENS, len(words))
-        chunk = " ".join(words[start:end]).strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == len(words):
-            break
-        start += CHUNK_SIZE_TOKENS - CHUNK_OVERLAP_TOKENS
-
     return chunks
 
 def _detect_section(text: str) -> str:

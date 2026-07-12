@@ -1,15 +1,17 @@
 """
-Hybrid Retriever — Dense + BM25 keyword + Image search with RRF fusion
-and cross-encoder reranking.
+Hybrid Retriever — Dense + BM25 keyword + Image search with Multi-Query Expansion,
+RRF fusion, cross-encoder reranking, confidence scoring, and caching.
 
 Pipeline:
-  1. Dense text search (Qdrant cosine similarity)
-  2. BM25 keyword search over payload text
+  1. Expand user query using LLM (generate 3 synonyms/formulations)
+  2. For each query variation:
+     - Perform dense text search (Qdrant cosine similarity)
+     - Perform BM25 keyword search over payload text
   3. Image search (when visual query detected or include_images=True)
-  4. Reciprocal Rank Fusion (RRF) to merge result lists
-  5. Cross-encoder reranking (BAAI/bge-reranker-large)
-
-Returns top-k results with full metadata for grounded answer generation.
+  4. Reciprocal Rank Fusion (RRF) to merge all text result lists
+  5. Cross-encoder reranking (BAAI/bge-reranker-large) using the original user query
+  6. Confidence scoring to filter low-relevance results (threshold = 0.35)
+  7. Return top-k results with full metadata.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Any
+from utils.cache import get_json_cache, set_json_cache
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +30,7 @@ _IMAGE_INTENT_PHRASES = (
     "location map", "location plan", "connectivity map", "route map",
     "amenity", "amenities", "clubhouse", "gym", "pool", "park",
     "elevation", "building view", "tower view", "exterior",
-    "interior", "inside view", "room view",
+    "inside view", "room view",
     "parking plan", "parking layout",
     "show", "image", "photo", "picture", "display", "view", "layout",
 )
@@ -47,7 +50,6 @@ RRF_K = 60
 # ── Reranker singleton ─────────────────────────────────────────────────────────
 _reranker = None
 
-
 def _get_reranker():
     """Lazy-load the BGE reranker cross-encoder."""
     global _reranker
@@ -59,16 +61,14 @@ def _get_reranker():
             _reranker = FlagReranker(RERANKER_MODEL, use_fp16=False)
             logger.info("Reranker loaded (FlagEmbedding).")
         except Exception as exc:
-            logger.warning("FlagEmbedding reranker failed (%s), trying sentence-transformers CrossEncoder", exc)
+            logger.warning("FlagEmbedding reranker failed (%s), trying sentence-transformers CrossEncoder: %s", RERANKER_MODEL, exc)
             from sentence_transformers import CrossEncoder
             _reranker = CrossEncoder(RERANKER_MODEL, max_length=512)
             logger.info("Reranker loaded (CrossEncoder).")
     return _reranker
 
-
 def reranker_status() -> dict:
     return {"loaded": _reranker is not None}
-
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  Public API
@@ -84,28 +84,22 @@ def retrieve(
     top_k: int = 8,
 ) -> list[dict]:
     """
-    Run hybrid retrieval and return ranked results.
-
-    Parameters
-    ----------
-    query:          User's natural language question.
-    document_id:    Optional — scope search to a specific document.
-    project_name:   Optional metadata filter.
-    builder:        Optional metadata filter.
-    document_type:  Optional metadata filter.
-    include_images: Force image retrieval even for text-only queries.
-    top_k:          Number of final results to return.
-
-    Returns
-    -------
-    List of result dicts with content, score, source_type, metadata, etc.
+    Run hybrid retrieval and return ranked results. Uses caching and multi-query expansion.
     """
+    # 0. Check cache
+    cache_key = f"retrieve:{query}:{document_id}:{project_name}:{builder}:{document_type}:{include_images}:{top_k}"
+    cached_results = get_json_cache(cache_key)
+    if cached_results is not None:
+        logger.info("Retrieval cache hit for query: %s", query[:40])
+        return cached_results
+
     from retrieval.qdrant_service import (
         search_images,
         search_text_dense,
         search_text_keyword,
     )
     from retrieval.embeddings import get_image_embedder, get_text_embedder
+    from retrieval.query_analyzer import expand_query, classify_query_intent
 
     # Build filters
     text_filters: dict[str, Any] = {}
@@ -125,22 +119,32 @@ def retrieve(
     image_intent = detect_image_intent(query)
     should_search_images = include_images or image_intent["requires_image"]
 
-    # ── 1. Dense text search ──────────────────────────────────────────────────
-    try:
-        query_vec = get_text_embedder().embed(query)
-        dense_results = search_text_dense(query_vec, text_filters or None, top_k=top_k * 2)
-    except Exception as exc:
-        logger.warning("Dense text search failed: %s", exc)
-        dense_results = []
+    # 1. Multi-Query Expansion
+    queries = expand_query(query)
+    logger.info("Expanded query: '%s' into %d variations: %s", query, len(queries), queries)
 
-    # ── 2. BM25 keyword search ────────────────────────────────────────────────
-    try:
-        keyword_results = search_text_keyword(query, text_filters or None, top_k=top_k * 2)
-    except Exception as exc:
-        logger.warning("BM25 keyword search failed: %s", exc)
-        keyword_results = []
+    all_dense_results = []
+    all_keyword_results = []
 
-    # ── 3. Image search ───────────────────────────────────────────────────────
+    # 2. Run Dense + Sparse Search for each query variation
+    text_embedder = get_text_embedder()
+    for q_var in queries:
+        # A. Dense text search
+        try:
+            query_vec = text_embedder.embed(q_var)
+            dense_res = search_text_dense(query_vec, text_filters or None, top_k=top_k * 2)
+            all_dense_results.append(dense_res)
+        except Exception as exc:
+            logger.warning("Dense text search failed for variation '%s': %s", q_var, exc)
+
+        # B. BM25 keyword search
+        try:
+            keyword_res = search_text_keyword(q_var, text_filters or None, top_k=top_k * 2)
+            all_keyword_results.append(keyword_res)
+        except Exception as exc:
+            logger.warning("BM25 keyword search failed for variation '%s': %s", q_var, exc)
+
+    # 3. Image search
     image_results: list[dict] = []
     if should_search_images:
         try:
@@ -154,20 +158,41 @@ def retrieve(
         except Exception as exc:
             logger.warning("Image search failed: %s", exc)
 
-    # ── 4. RRF fusion ─────────────────────────────────────────────────────────
-    text_fused = _rrf_fuse([dense_results, keyword_results])
+    # 4. RRF fusion across all variations and dense/sparse lists
+    all_lists = all_dense_results + all_keyword_results
+    text_fused = _rrf_fuse(all_lists)
     all_results = _merge_text_and_image(text_fused, image_results, image_intent)
 
-    # ── 5. Reranking ──────────────────────────────────────────────────────────
-    # Only rerank text results (image results keep their scores)
+    # 5. Reranking using Cross-Encoder against the original query
     text_only = [r for r in all_results if r.get("source_type") == "text"]
     image_only = [r for r in all_results if r.get("source_type") == "image"]
 
     if len(text_only) > 1:
         text_only = _rerank(query, text_only)
 
+    # 6. Confidence Filtering
+    # Filter text candidates whose confidence score is below 0.35
+    confident_text = []
+    for r in text_only:
+        # Normalize rerank score
+        score = r.get("rerank_score", 0.0)
+        # If score is in logits (negative), apply soft mapping
+        if score < 0:
+            confidence = float(1.0 / (1.0 + float(math.exp(-score))))
+        else:
+            confidence = score
+            
+        r["confidence_score"] = confidence
+        
+        # Keep if confidence is above threshold
+        if confidence >= 0.35:
+            confident_text.append(r)
+
     # Interleave: top text + top images, then slice to top_k
-    final = _interleave(text_only, image_only, top_k)
+    final = _interleave(confident_text, image_only, top_k)
+
+    # Cache result
+    set_json_cache(cache_key, final, expire_seconds=3600)
 
     return final
 
@@ -175,9 +200,6 @@ def retrieve(
 def detect_image_intent(query: str) -> dict:
     """
     Detect whether a query requires image results.
-
-    Returns:
-        {requires_image: bool, detected_types: list[str]}
     """
     q = query.lower()
     detected_types: list[str] = []
@@ -197,7 +219,6 @@ def detect_image_intent(query: str) -> dict:
 def _rrf_fuse(result_lists: list[list[dict]]) -> list[dict]:
     """
     Apply Reciprocal Rank Fusion across multiple ranked result lists.
-    Result dicts must have an 'id' field.
     """
     scores: dict[str, float] = {}
     payloads: dict[str, dict] = {}
@@ -276,11 +297,9 @@ def _merge_text_and_image(
     return merged
 
 
-
 def _rerank(query: str, results: list[dict]) -> list[dict]:
     """
     Rerank results using BAAI/bge-reranker-large cross-encoder.
-    Falls back to original order if reranker unavailable.
     """
     try:
         reranker = _get_reranker()
@@ -312,7 +331,6 @@ def _interleave(
 ) -> list[dict]:
     """
     Merge text and image results respecting top_k.
-    Images are appended after text results; total capped at top_k.
     """
     final: list[dict] = []
     final.extend(text_results[: max(top_k - len(image_results[:3]), top_k // 2)])

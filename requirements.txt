@@ -43,3 +43,8 @@ pydantic
 # ── Utilities ─────────────────────────────────────────────────────────────────
 numpy
 
+# ── Enterprise RAG Additions ──────────────────────────────────────────────────
+python-docx
+python-pptx
+openpyxl
+redis

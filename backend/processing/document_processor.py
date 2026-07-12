@@ -2,7 +2,9 @@ import os
 import json
 import logging
 import tempfile
+import hashlib
 from datetime import datetime, timezone
+import fitz # PyMuPDF
 
 logger = logging.getLogger(__name__)
 
@@ -16,21 +18,66 @@ def _clean_llm_output(text: str) -> str:
         text = "\n".join(lines).strip()
     return text
 
+def validate_and_hash_file(file_path: str) -> str:
+    """
+    Validate file uploads for security and compute hash.
+    Rejects Executable files, Oversized files, and Encrypted/Corrupted PDFs.
+    """
+    # 1. Size Check (50MB Limit)
+    max_bytes = 50 * 1024 * 1024
+    file_size = os.path.getsize(file_path)
+    if file_size > max_bytes:
+        raise ValueError(f"File size exceeds 50MB limit: {file_size} bytes")
+    if file_size == 0:
+        raise ValueError("Uploaded file is empty.")
+
+    # 2. Executable / Malicious Check (MZ or ELF magic bytes)
+    with open(file_path, "rb") as f:
+        magic_bytes = f.read(4)
+        if magic_bytes.startswith(b"MZ") or magic_bytes.startswith(b"\x7fELF"):
+            raise ValueError("Executable files are not permitted for security reasons.")
+
+    # 3. PDF validation
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        try:
+            doc = fitz.open(file_path)
+            if doc.is_encrypted:
+                doc.close()
+                raise ValueError("Encrypted PDFs are not supported.")
+            if doc.page_count == 0:
+                doc.close()
+                raise ValueError("PDF has no pages.")
+            doc.close()
+        except Exception as exc:
+            if "encrypted" in str(exc).lower():
+                raise ValueError("Encrypted PDFs are not supported.")
+            raise ValueError(f"Corrupted or invalid PDF file: {exc}")
+
+    # 4. Compute SHA-256 Hash
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(8192):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
 def process_document_background(document_id: str, file_path: str, metadata: dict) -> None:
     """
     Entire backend document ingestion, RAG vector embedding, and Qdrant indexing pipeline.
     Runs asynchronously and persists progress at each stage.
     """
     from storage.doc_status import set_status
-    from ingestion.extractor import extract_document
     from ingestion.cleaner import clean_text
     from formatter.llm_formatter import format_with_llm
     from formatter.project_normalizer import normalize_project_data
-    from ingestion.image_extractor import extract_images_from_pdf
-    from ingestion.image_analyzer import analyze_images, page_metadata_from_images
-    from storage.mongo_store import save_file_to_mongo, save_project_to_mongo
+    from storage.mongo_store import (
+        save_file_to_mongo, 
+        save_project_to_mongo, 
+        _get_collection, 
+        _load_projects_locally
+    )
     
-    from ingestion.pdf_processor import process_pdf
+    from ingestion.multiformat_parser import parse_document
     from ingestion.chunker import chunk_text_pages
     from ingestion.image_processor import build_image_embedding_text, process_images
     from retrieval.embeddings import get_image_embedder, get_text_embedder
@@ -56,15 +103,102 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
         description = metadata.get("description", "")
         tags = metadata.get("tags", "")
 
-        # ── 1. Legacy Text Extraction ──────────────────────────────────────────
-        set_status(document_id, "extracting_text")
+        # Excavator specific fields
+        domain = metadata.get("domain", "real_estate")
+        doc_type = metadata.get("doc_type", "")
+        revision_date = metadata.get("revision_date", "")
+        section_path = metadata.get("section_path", "")
+        component_tags = metadata.get("component_tags", "")
+        dtc_codes = metadata.get("dtc_codes", "")
+        supersedes_doc_id = metadata.get("supersedes_doc_id", "")
+
+        # ── 0. Security Validation & Hash computation ───────────────────────────
+        set_status(document_id, "uploaded", message="Validating file security...")
+        file_hash = validate_and_hash_file(file_path)
+        logger.info("[%s] File hash: %s", document_id, file_hash)
+
+        # ── 0.5 Deduplication check ──────────────────────────────────────────────
+        set_status(document_id, "uploaded", message="Checking for duplicates...")
+        existing_doc = None
+        
+        # Check MongoDB
         try:
-            raw_text = extract_document(file_path)
-            cleaned_text = clean_text(raw_text)
-            logger.info("[%s] Text extracted: %d chars", document_id, len(cleaned_text))
+            col = _get_collection()
+            if col is not None:
+                existing_doc = col.find_one({"hash": file_hash})
         except Exception as exc:
-            logger.warning("[%s] Text extraction error: %s", document_id, exc)
-            cleaned_text = ""
+            logger.warning("[%s] Failed to query Mongo for hash: %s", document_id, exc)
+
+        # Check local storage fallback
+        if not existing_doc:
+            try:
+                local_projects = _load_projects_locally(include_raw_text=True)
+                for p in local_projects:
+                    if p.get("hash") == file_hash:
+                        existing_doc = p
+                        break
+            except Exception as exc:
+                logger.warning("[%s] Failed to query local fallback for hash: %s", document_id, exc)
+
+        if existing_doc:
+            logger.info("[%s] Duplicate document detected! Reusing data from document_id: %s", 
+                        document_id, existing_doc.get("document_id"))
+            
+            # Reuse MongoDB / Local data
+            reused_doc = dict(existing_doc)
+            reused_doc["document_id"] = document_id
+            reused_doc["source_file"] = source_file
+            reused_doc["stored_file"] = os.path.basename(file_path)
+            
+            # Overwrite metadata values if new values are provided
+            reused_metadata = reused_doc.get("metadata", {})
+            if title: reused_metadata["title"] = title
+            if builder: reused_metadata["builder"] = builder
+            if project: reused_metadata["project"] = project
+            if document_type: reused_metadata["document_type"] = document_type
+            if description: reused_metadata["description"] = description
+            if tags: reused_metadata["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            
+            # Excavator specific
+            if doc_type: reused_metadata["doc_type"] = doc_type
+            if revision_date: reused_metadata["revision_date"] = revision_date
+            if section_path: reused_metadata["section_path"] = section_path
+            if component_tags: reused_metadata["component_tags"] = [t.strip() for t in component_tags.split(",") if t.strip()]
+            if dtc_codes: reused_metadata["dtc_codes"] = [t.strip() for t in dtc_codes.split(",") if t.strip()]
+            if supersedes_doc_id: reused_metadata["supersedes_doc_id"] = supersedes_doc_id
+            
+            reused_doc["metadata"] = reused_metadata
+            reused_doc["domain"] = domain
+
+            save_project_to_mongo(reused_doc)
+            
+            # Update status to ready
+            set_status(
+                document_id,
+                "ready",
+                text_chunks_indexed=reused_doc.get("text_chunks_indexed", 0),
+                images_indexed=reused_doc.get("images_indexed", 0),
+                total_pages=len(reused_doc.get("pages", [])),
+                message="Duplicate document detected. Reused previous embeddings and metadata successfully."
+            )
+            logger.info("=== BACKGROUND PROCESSOR SUCCESS (DEDUPLICATED) | doc=%s ===", document_id)
+            return
+
+        # ── 1. Text Extraction using Multiformat Parser ─────────────────────────
+        set_status(document_id, "extracting_text")
+        rag_images_dir = os.path.join(os.path.dirname(file_path), "rag_images")
+        
+        processed = parse_document(
+            file_path=file_path,
+            document_id=document_id,
+            source_file=source_file,
+            output_folder=rag_images_dir,
+            image_base_path=f"documents/{document_id}/images",
+        )
+        pages = processed.get("pages", [])
+        total_pages = processed.get("total_pages", len(pages))
+        cleaned_text = clean_text(processed.get("full_text", ""))
+        logger.info("[%s] Text extracted: %d chars, %d pages", document_id, len(cleaned_text), total_pages)
 
         # ── 2. LLM metadata formatter ────────────────────────────────────────
         try:
@@ -86,40 +220,25 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
         if metadata_builder:
             json_data["developer"] = metadata_builder
 
-        # ── 3. Legacy Image Extraction ─────────────────────────────────────────
+        # ── 4. Save original file to MongoDB GridFS ───────────────────────────
+        try:
+            saved_file_id = save_file_to_mongo(
+                document_id=document_id,
+                file_path=file_path,
+                filename=source_file,
+                content_type=content_type,
+                file_kind="pdf" if source_file.lower().endswith(".pdf") else "other",
+            )
+            logger.info("[%s] Document file saved: id=%s", document_id, saved_file_id)
+        except Exception as exc:
+            logger.error("[%s] Document file save failed: %s", document_id, exc)
+            saved_file_id = None
+
+        # ── 5. Save page images to MongoDB GridFS if PDF or Scanned ───────────
         set_status(document_id, "extracting_images")
-        
-        # Create temp folder for image extraction
-        with tempfile.TemporaryDirectory(prefix=f"proc_{document_id}_") as temp_dir:
-            image_folder = os.path.join(temp_dir, "images")
-            image_metadata = []
-            try:
-                extracted_images = extract_images_from_pdf(
-                    file_path,
-                    output_folder=image_folder,
-                    image_base_path=f"documents/{document_id}/images",
-                )
-                image_metadata = analyze_images(extracted_images, cleaned_text)
-                logger.info("[%s] Legacy images extracted: %d", document_id, len(image_metadata))
-            except Exception as exc:
-                logger.warning("[%s] Legacy image extraction error: %s", document_id, exc)
-
-            # ── 4. Save PDF to MongoDB GridFS ──────────────────────────────────
-            try:
-                saved_pdf_id = save_file_to_mongo(
-                    document_id=document_id,
-                    file_path=file_path,
-                    filename=source_file,
-                    content_type=content_type,
-                    file_kind="pdf",
-                )
-                logger.info("[%s] PDF saved: id=%s", document_id, saved_pdf_id)
-            except Exception as exc:
-                logger.error("[%s] PDF save failed: %s", document_id, exc)
-                saved_pdf_id = None
-
-            # ── 5. Save images to MongoDB GridFS ───────────────────────────────
-            for image in image_metadata:
+        image_metadata = []
+        for page in pages:
+            for image in page.get("images", []):
                 image_id = image.get("image_id")
                 local_path = image.pop("local_path", None)
                 if not image_id or not local_path:
@@ -133,62 +252,79 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
                         file_kind="image",
                         image_id=image_id,
                     )
+                    image["image_path"] = f"documents/{document_id}/images/{image_id}"
+                    image_metadata.append(image)
                 except Exception as exc:
                     logger.warning("[%s] Image save failed for %s: %s", document_id, image_id, exc)
-                image["image_path"] = f"documents/{document_id}/images/{image_id}"
 
-            # ── 6. Assemble project document & Save ───────────────────────────
-            json_data.update({
-                "images": image_metadata,
-                "pages": page_metadata_from_images(image_metadata),
-                "document_id": document_id,
-                "source_file": source_file,
-                "stored_file": os.path.basename(file_path),
-                "raw_text": cleaned_text,
-                "pdf_path": f"documents/{document_id}/pdf",
-                "rag_status": "processing",
-                "metadata": {
-                    "title": title or source_file,
-                    "builder": metadata_builder,
-                    "project": metadata_project,
-                    "document_type": document_type or "",
-                    "description": description or "",
-                    "tags": [t.strip() for t in (tags or "").split(",") if t.strip()],
-                },
-            })
+        # ── 6. Assemble project document & Save ───────────────────────────
+        json_data.update({
+            "images": image_metadata,
+            "pages": pages,
+            "document_id": document_id,
+            "source_file": source_file,
+            "stored_file": os.path.basename(file_path),
+            "raw_text": cleaned_text,
+            "pdf_path": f"documents/{document_id}/pdf",
+            "rag_status": "processing",
+            "hash": file_hash,  # Store hash for deduplication
+            "domain": domain,
+            "metadata": {
+                "title": title or source_file,
+                "builder": metadata_builder,
+                "project": metadata_project,
+                "document_type": document_type or "",
+                "description": description or "",
+                "tags": [t.strip() for t in (tags or "").split(",") if t.strip()],
+                # Excavator fields
+                "doc_type": doc_type or "",
+                "revision_date": revision_date or "",
+                "section_path": section_path or "",
+                "component_tags": [t.strip() for t in (component_tags or "").split(",") if t.strip()],
+                "dtc_codes": [t.strip() for t in (dtc_codes or "").split(",") if t.strip()],
+                "supersedes_doc_id": supersedes_doc_id or "",
+            },
+        })
 
-            # Save project metadata
-            try:
-                saved_document = save_project_to_mongo(json_data)
-                if saved_document:
-                    logger.info("[%s] Project metadata saved successfully", document_id)
-            except Exception as exc:
-                logger.error("[%s] Project save failed: %s", document_id, exc)
-
-        # ── 7. Multimodal Hybrid RAG vector indexing ─────────────────────────
-        # Note: We keep a persistent image folder location for RAG image processing
-        rag_images_dir = os.path.join(os.path.dirname(file_path), "rag_images")
-        
-        # ── Stage 1: Extract text and run OCR where needed ──────────────────────
-        set_status(document_id, "extracting_text")
-        processed = process_pdf(
-            pdf_path=file_path,
-            document_id=document_id,
-            source_file=source_file,
-            output_folder=rag_images_dir,
-            image_base_path=f"documents/{document_id}/images",
-        )
-        pages = processed.get("pages", [])
-        total_pages = processed.get("total_pages", len(pages))
-        
         # ── Stage 2: Chunk text ──────────────────────────────────────────
         set_status(document_id, "chunking", total_pages=total_pages)
-        doc_metadata = {
-            "project_name": metadata_project,
-            "builder": metadata_builder,
-            "document_type": document_type,
-            "source_file": source_file,
-        }
+        
+        # Calculate dynamic confidence weight for excavator
+        if domain == "excavator":
+            weights = {
+                "manuals": 1.0,
+                "parts_catalog": 0.9,
+                "service_bulletins": 0.85,
+                "field_reports": 0.7,
+                "maintenance_logs": 0.6,
+            }
+            confidence_weight = weights.get(doc_type.lower(), 0.5)
+            
+            doc_metadata = {
+                "domain": "excavator",
+                "doc_id": document_id,
+                "doc_type": doc_type,
+                "title": title or source_file,
+                "source_file": source_file,
+                "revision_date": revision_date,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "section_path": section_path,
+                "machine_model": "R215L",
+                "component_tags": [t.strip() for t in (component_tags or "").split(",") if t.strip()],
+                "dtc_codes": [t.strip() for t in (dtc_codes or "").split(",") if t.strip()],
+                "supersedes_doc_id": supersedes_doc_id,
+                "confidence_weight": confidence_weight,
+            }
+        else:
+            doc_metadata = {
+                "domain": "real_estate",
+                "project_name": metadata_project,
+                "builder": metadata_builder,
+                "document_type": document_type,
+                "source_file": source_file,
+                "hash": file_hash,
+            }
+            
         text_chunks = chunk_text_pages(pages, document_id, doc_metadata)
         logger.info("[%s] Text chunks created: %d", document_id, len(text_chunks))
 
@@ -229,10 +365,33 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
         set_status(document_id, "indexing_qdrant", total_pages=total_pages)
         create_collections()
 
+        # Determine target Qdrant collections
+        target_text_collection = None
+        target_image_collection = None
+        
+        if domain == "excavator":
+            target_image_collection = "im_manuals_images"
+            if doc_type == "manuals":
+                target_text_collection = "im_manuals_text"
+            elif doc_type == "service_bulletins":
+                target_text_collection = "im_service_bulletins"
+            elif doc_type == "maintenance_logs":
+                target_text_collection = "im_maintenance_logs"
+            elif doc_type == "parts_catalog":
+                target_text_collection = "im_parts_catalog"
+            elif doc_type == "field_reports":
+                target_text_collection = "im_field_reports"
+
         if text_chunks:
-            text_chunks_indexed = upsert_text_chunks(text_chunks)
+            text_chunks_indexed = upsert_text_chunks(text_chunks, collection_name=target_text_collection)
         if image_records:
-            images_indexed = upsert_image_chunks(image_records)
+            images_indexed = upsert_image_chunks(image_records, collection_name=target_image_collection)
+
+        # Save metadata to MongoDB/Local Fallback
+        json_data["text_chunks_indexed"] = text_chunks_indexed
+        json_data["images_indexed"] = images_indexed
+        json_data["rag_status"] = "ready"
+        save_project_to_mongo(json_data)
 
         # ── Stage 6: Ready! ──────────────────────────────────────────────
         set_status(

@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import uuid
+import hashlib
 from typing import Any
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Response, UploadFile
@@ -134,11 +135,25 @@ def clean_llm_output(text: str) -> str:
     return text
 
 
-def _is_pdf(content_type: str | None, filename: str) -> bool:
-    if content_type and "pdf" in content_type.lower():
+def _is_supported_format(content_type: str | None, filename: str) -> bool:
+    ext = os.path.splitext(filename)[1].lower()
+    supported_extensions = {
+        ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt",
+        ".png", ".jpg", ".jpeg", ".webp"
+    }
+    if ext in supported_extensions:
         return True
-    if filename and filename.lower().endswith(".pdf"):
-        return True
+    if content_type:
+        lower_mime = content_type.lower()
+        supported_mimes = {
+            "application/pdf", 
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "text/csv", "text/plain", "image/png", "image/jpeg", "image/webp"
+        }
+        if lower_mime in supported_mimes:
+            return True
     return False
 
 
@@ -156,23 +171,27 @@ async def upload_pdf(
     document_type: str | None = Form(default=None),
     description: str | None = Form(default=None),
     tags: str | None = Form(default=None),
+    # Excavator Domain Fields
+    domain: str | None = Form(default="real_estate"),
+    doc_type: str | None = Form(default=None),
+    revision_date: str | None = Form(default=None),
+    section_path: str | None = Form(default=None),
+    component_tags: str | None = Form(default=None),
+    dtc_codes: str | None = Form(default=None),
+    supersedes_doc_id: str | None = Form(default=None),
 ):
     """
-    Upload a real-estate PDF.
-
-    Returns immediately with status="processing".
-    RAG indexing (extraction → embedding → Qdrant Cloud) runs in background.
-    Poll GET /documents/{document_id}/status for progress.
+    Upload a real-estate or excavator document.
     """
     # ── Validate file ─────────────────────────────────────────────────────────
     if file is None or not file.filename:
         raise HTTPException(status_code=400, detail="No file was uploaded.")
 
     safe_filename = os.path.basename(file.filename)
-    if not _is_pdf(file.content_type, safe_filename):
+    if not _is_supported_format(file.content_type, safe_filename):
         raise HTTPException(
             status_code=400,
-            detail=f"Only PDF files are accepted. Got: {file.content_type or safe_filename}",
+            detail=f"Unsupported file format. Supported: PDF, DOCX, PPTX, XLSX, CSV, TXT, PNG, JPEG, WEBP. Got: {file.content_type or safe_filename}",
         )
 
     document_id = uuid.uuid4().hex
@@ -215,14 +234,87 @@ async def upload_pdf(
             )
 
 
+    if domain == "excavator":
+        if not doc_type:
+            raise HTTPException(status_code=400, detail="For excavator domain, 'doc_type' is required.")
+        valid_types = {"manuals", "service_bulletins", "maintenance_logs", "parts_catalog", "field_reports"}
+        if doc_type.lower() not in valid_types:
+            raise HTTPException(status_code=400, detail=f"Invalid doc_type for excavator. Must be one of: {list(valid_types)}")
+
     logger.info("=== UPLOAD START | doc=%s | file=%s ===", document_id, safe_filename)
 
-    # Read bytes eagerly — must happen before any async context switch
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) < 100:
-        raise HTTPException(status_code=400, detail="Uploaded file appears to be empty or corrupt.")
+    # Read bytes eagerly
+    file_bytes = await file.read()
+    if len(file_bytes) < 10:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty or corrupt.")
 
-    logger.info("[%s] PDF read: %d bytes", document_id, len(pdf_bytes))
+    # Eagerly compute hash and check for duplicates to save computing time
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    
+    # ── Verify duplicates in MongoDB ─────────────────────────────────────────
+    existing_doc = None
+    try:
+        from storage.mongo_store import _get_collection, _load_projects_locally
+        col = _get_collection()
+        if col is not None:
+            existing_doc = col.find_one({"hash": file_hash})
+        if not existing_doc:
+            local_projects = _load_projects_locally(include_raw_text=True)
+            for p in local_projects:
+                if p.get("hash") == file_hash:
+                    existing_doc = p
+                    break
+    except Exception as exc:
+        logger.warning("[%s] Duplicate check exception: %s", document_id, exc)
+
+    if existing_doc:
+        # Re-save metadata with new doc_id so it can be queried immediately
+        try:
+            from storage.mongo_store import save_project_to_mongo
+            reused_doc = dict(existing_doc)
+            reused_doc["document_id"] = document_id
+            reused_doc["source_file"] = safe_filename
+            reused_doc["stored_file"] = f"{document_id}_{safe_filename}"
+            reused_doc["domain"] = domain
+            
+            reused_meta = reused_doc.get("metadata", {})
+            if title: reused_meta["title"] = title
+            if builder: reused_meta["builder"] = builder
+            if project: reused_meta["project"] = project
+            if document_type: reused_meta["document_type"] = document_type
+            if description: reused_meta["description"] = description
+            if tags: reused_meta["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            
+            # Excavator specific
+            if doc_type: reused_meta["doc_type"] = doc_type
+            if revision_date: reused_meta["revision_date"] = revision_date
+            if section_path: reused_meta["section_path"] = section_path
+            if component_tags: reused_meta["component_tags"] = [t.strip() for t in component_tags.split(",") if t.strip()]
+            if dtc_codes: reused_meta["dtc_codes"] = [t.strip() for t in dtc_codes.split(",") if t.strip()]
+            if supersedes_doc_id: reused_meta["supersedes_doc_id"] = supersedes_doc_id
+            reused_doc["metadata"] = reused_meta
+            
+            save_project_to_mongo(reused_doc)
+            save_initial_status(document_id, status="ready", progress=100, filename=safe_filename)
+            set_status(document_id, "ready", 
+                       text_chunks_indexed=reused_doc.get("text_chunks_indexed", 0),
+                       images_indexed=reused_doc.get("images_indexed", 0),
+                       total_pages=len(reused_doc.get("pages", [])),
+                       message="Duplicate document detected. Reused previous embeddings.")
+            
+            return {
+                "document_id": document_id,
+                "status": "ready",
+                "progress": 100,
+                "filename": safe_filename,
+                "message": "Duplicate document detected. Embeddings successfully reused.",
+                "saved_to_mongodb": mongo_ok,
+                "ocr_used": False,
+            }
+        except Exception as exc:
+            logger.warning("[%s] Failed to reuse deduplicated document: %s", document_id, exc)
+
+    logger.info("[%s] File read: %d bytes", document_id, len(file_bytes))
 
     # Mark status immediately so frontend polling starts working
     save_initial_status(document_id, status="uploaded", progress=5, filename=safe_filename)
@@ -233,7 +325,7 @@ async def upload_pdf(
     file_path = os.path.join(UPLOAD_FOLDER, stored_filename)
     try:
         with open(file_path, "wb") as buf:
-            buf.write(pdf_bytes)
+            buf.write(file_bytes)
         logger.info("[%s] Saved uploaded file permanently to %s", document_id, file_path)
     except Exception as exc:
         logger.error("[%s] Failed to save uploaded file permanently: %s", document_id, exc)
@@ -242,6 +334,7 @@ async def upload_pdf(
 
     # Enqueue background task
     metadata = {
+        "domain": domain,
         "source_file": safe_filename,
         "content_type": file.content_type or "application/pdf",
         "title": title or "",
@@ -250,6 +343,13 @@ async def upload_pdf(
         "document_type": document_type or "",
         "description": description or "",
         "tags": tags or "",
+        # Excavator specific
+        "doc_type": doc_type or "",
+        "revision_date": revision_date or "",
+        "section_path": section_path or "",
+        "component_tags": component_tags or "",
+        "dtc_codes": dtc_codes or "",
+        "supersedes_doc_id": supersedes_doc_id or "",
     }
     
     enqueue_document_processing(
@@ -331,11 +431,13 @@ async def chat(query: Any = Body(...)):
     document_id = None
     top_k = 8
     include_images = False
+    domain = "real_estate"
 
     if isinstance(query, dict):
         document_id = query.get("document_id")
         include_images = bool(query.get("include_images", False))
         top_k = int(query.get("top_k", 8))
+        domain = query.get("domain", "real_estate")
         query = query.get("message") or query.get("query") or ""
 
     question = str(query).strip()
@@ -346,6 +448,19 @@ async def chat(query: Any = Body(...)):
             "citations": [],
             "images": [],
             "confidence": "low",
+        }
+
+    # ── Excavator Scaffolding Route ───────────────────────────────────────────
+    if domain == "excavator":
+        from chatbot.query_router import classify_im_query
+        routing_info = classify_im_query(question)
+        return {
+            "question": question,
+            "answer": f"[SCANNED ROUTE: {routing_info['category'].upper()}] - Scaffolding for Hyundai excavator RAG active.",
+            "citations": [],
+            "images": [],
+            "confidence": "high",
+            "routing": routing_info,
         }
 
     # ── Guard: document must be ready ─────────────────────────────────────────
@@ -378,21 +493,23 @@ async def chat(query: Any = Body(...)):
 
     # ── Try Hybrid RAG ────────────────────────────────────────────────────────
     try:
-        retrieved = retrieve(
-            query=question,
-            document_id=document_id,
-            include_images=include_images or intent.get("requires_visual_response", False),
-            top_k=top_k,
-        )
-        if retrieved:
-            rag_response = generate_grounded_answer(question, retrieved)
-            rag_response["intent"] = {
-                **intent,
-                "requires_image": image_intent["requires_image"],
-                "requires_text": True,
-                "detected_image_types": image_intent.get("detected_types", []),
-            }
-            return rag_response
+        from utils.observability import time_stage
+        with time_stage("total_response_times"):
+            retrieved = retrieve(
+                query=question,
+                document_id=document_id,
+                include_images=include_images or intent.get("requires_visual_response", False),
+                top_k=top_k,
+            )
+            if retrieved:
+                rag_response = generate_grounded_answer(question, retrieved)
+                rag_response["intent"] = {
+                    **intent,
+                    "requires_image": image_intent["requires_image"],
+                    "requires_text": True,
+                    "detected_image_types": image_intent.get("detected_types", []),
+                }
+                return rag_response
     except Exception as exc:
         logger.warning("RAG pipeline failed, falling back to legacy path: %s", exc)
 
@@ -498,6 +615,20 @@ async def projects():
 @app.get("/builders")
 async def builders():
     return {"builders": load_builders()}
+
+
+@app.get("/rag/metrics")
+async def rag_metrics():
+    """Retrieve observability metrics."""
+    from utils.observability import get_observability_metrics
+    return get_observability_metrics()
+
+
+@app.get("/rag/evaluation")
+async def rag_evaluation():
+    """Retrieve evaluation scores and logs."""
+    from utils.evaluation import get_summarized_evaluations
+    return get_summarized_evaluations()
 
 
 # ════════════════════════════════════════════════════════════════════════════════

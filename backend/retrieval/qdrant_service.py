@@ -3,8 +3,8 @@ Qdrant service layer for the Hybrid Multimodal RAG pipeline.
 
 Provides helper functions to:
   - Create text and image vector collections
-  - Upsert / search text chunks
-  - Upsert / search image chunks
+  - Upsert / search text chunks (supports dynamic collections)
+  - Upsert / search image chunks (supports dynamic collections)
   - Delete vectors by document_id
   - Health check
 """
@@ -34,7 +34,6 @@ def get_qdrant_client():
     """Return the shared Qdrant client from qdrant_client."""
     from retrieval.qdrant_client import client
     return client
-
 
 
 # ── Collection management ──────────────────────────────────────────────────────
@@ -76,9 +75,9 @@ def create_collections() -> dict[str, str]:
 
 # ── Text chunks ────────────────────────────────────────────────────────────────
 
-def upsert_text_chunks(chunks: list[dict]) -> int:
+def upsert_text_chunks(chunks: list[dict], collection_name: str | None = None) -> int:
     """
-    Upsert a list of text chunk dicts into the text collection.
+    Upsert a list of text chunk dicts into the target collection.
 
     Each chunk must have:
       - ``vector``   : list[float] — dense embedding
@@ -91,6 +90,7 @@ def upsert_text_chunks(chunks: list[dict]) -> int:
     if not chunks:
         return 0
 
+    target = collection_name or QDRANT_COLLECTION_TEXT
     client = get_qdrant_client()
     points: list[PointStruct] = []
 
@@ -108,14 +108,14 @@ def upsert_text_chunks(chunks: list[dict]) -> int:
             )
         )
 
-    client.upsert(collection_name=QDRANT_COLLECTION_TEXT, points=points)
-    logger.info("Upserted %d text chunks into Qdrant", len(points))
+    client.upsert(collection_name=target, points=points)
+    logger.info("Upserted %d text chunks into Qdrant collection '%s'", len(points), target)
     return len(points)
 
 
-def upsert_image_chunks(chunks: list[dict]) -> int:
+def upsert_image_chunks(chunks: list[dict], collection_name: str | None = None) -> int:
     """
-    Upsert image metadata records into the image collection.
+    Upsert image metadata records into the target image collection.
 
     Each chunk must have:
       - ``vector``   : list[float] — image/caption embedding
@@ -127,6 +127,7 @@ def upsert_image_chunks(chunks: list[dict]) -> int:
     if not chunks:
         return 0
 
+    target = collection_name or QDRANT_COLLECTION_IMAGES
     client = get_qdrant_client()
     points: list[PointStruct] = []
 
@@ -144,8 +145,8 @@ def upsert_image_chunks(chunks: list[dict]) -> int:
             )
         )
 
-    client.upsert(collection_name=QDRANT_COLLECTION_IMAGES, points=points)
-    logger.info("Upserted %d image chunks into Qdrant", len(points))
+    client.upsert(collection_name=target, points=points)
+    logger.info("Upserted %d image chunks into Qdrant collection '%s'", len(points), target)
     return len(points)
 
 
@@ -155,15 +156,17 @@ def search_text_dense(
     query_vector: list[float],
     filters: dict | None = None,
     top_k: int = 10,
+    collection_name: str | None = None,
 ) -> list[dict]:
-    """Dense cosine similarity search over the text collection."""
+    """Dense cosine similarity search over the target collection."""
     from qdrant_client.models import Filter
 
+    target = collection_name or QDRANT_COLLECTION_TEXT
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
     results = client.search(
-        collection_name=QDRANT_COLLECTION_TEXT,
+        collection_name=target,
         query_vector=query_vector,
         query_filter=qdrant_filter,
         limit=top_k,
@@ -176,21 +179,20 @@ def search_text_keyword(
     query_text: str,
     filters: dict | None = None,
     top_k: int = 10,
+    collection_name: str | None = None,
 ) -> list[dict]:
     """
-    Keyword-based search over the text collection using Qdrant payload scroll
+    Keyword-based search over the target collection using Qdrant payload scroll
     + BM25 re-scoring over the returned payloads.
-
-    This scrolls a reasonable chunk of the collection (up to 500 records) then
-    applies BM25 locally. Sufficient for small-to-medium deployments.
     """
     from rank_bm25 import BM25Okapi
 
+    target = collection_name or QDRANT_COLLECTION_TEXT
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
     scroll_result, _ = client.scroll(
-        collection_name=QDRANT_COLLECTION_TEXT,
+        collection_name=target,
         scroll_filter=qdrant_filter,
         limit=500,
         with_payload=True,
@@ -228,13 +230,15 @@ def search_images(
     query_vector: list[float],
     filters: dict | None = None,
     top_k: int = 6,
+    collection_name: str | None = None,
 ) -> list[dict]:
     """Dense cosine similarity search over the image collection."""
+    target = collection_name or QDRANT_COLLECTION_IMAGES
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
     results = client.search(
-        collection_name=QDRANT_COLLECTION_IMAGES,
+        collection_name=target,
         query_vector=query_vector,
         query_filter=qdrant_filter,
         limit=top_k,
@@ -245,8 +249,11 @@ def search_images(
 
 # ── Delete ─────────────────────────────────────────────────────────────────────
 
-def delete_vectors_by_document_id(document_id: str) -> dict[str, int]:
-    """Delete all Qdrant vectors (text + image) associated with a document_id."""
+def delete_vectors_by_document_id(
+    document_id: str,
+    collection_names: list[str] | None = None,
+) -> dict[str, int]:
+    """Delete all Qdrant vectors associated with a document_id across specified collections."""
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
     client = get_qdrant_client()
@@ -254,22 +261,22 @@ def delete_vectors_by_document_id(document_id: str) -> dict[str, int]:
         must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))]
     )
 
-    text_result = client.delete(
-        collection_name=QDRANT_COLLECTION_TEXT,
-        points_selector=doc_filter,
-    )
-    image_result = client.delete(
-        collection_name=QDRANT_COLLECTION_IMAGES,
-        points_selector=doc_filter,
-    )
+    targets = collection_names or [QDRANT_COLLECTION_TEXT, QDRANT_COLLECTION_IMAGES]
+    results = {}
 
-    logger.info(
-        "Deleted Qdrant vectors for document_id=%s: text=%s image=%s",
-        document_id,
-        text_result,
-        image_result,
-    )
-    return {"text_deleted": 1, "image_deleted": 1}
+    for col in targets:
+        try:
+            delete_res = client.delete(
+                collection_name=col,
+                points_selector=doc_filter,
+            )
+            results[f"{col}_deleted"] = 1
+        except Exception as exc:
+            logger.warning("Failed to delete points from collection %s: %s", col, exc)
+            results[f"{col}_deleted"] = 0
+
+    logger.info("Deleted Qdrant vectors for document_id=%s across %s: %s", document_id, targets, results)
+    return results
 
 
 # ── Health check ───────────────────────────────────────────────────────────────
@@ -327,17 +334,22 @@ def _str_to_uuid(value: str) -> str:
 
 
 def _build_filter(filters: dict | None):
-    """Convert a simple key→value filter dict to a Qdrant Filter object."""
+    """Convert a filter dict supporting lists (e.g. for dtc_codes / tags) to a Qdrant Filter object."""
     if not filters:
         return None
 
-    from qdrant_client.models import FieldCondition, Filter, MatchValue
+    from qdrant_client.models import FieldCondition, Filter, MatchValue, MatchAny
 
-    conditions = [
-        FieldCondition(key=k, match=MatchValue(value=v))
-        for k, v in filters.items()
-        if v is not None
-    ]
+    conditions = []
+    for k, v in filters.items():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            # Support matching any values in the payload array
+            conditions.append(FieldCondition(key=k, match=MatchAny(any=v)))
+        else:
+            conditions.append(FieldCondition(key=k, match=MatchValue(value=v)))
+
     return Filter(must=conditions) if conditions else None
 
 

@@ -234,6 +234,45 @@ export default function UserChatPage() {
       .catch(() => setDocuments([]));
   }, []);
 
+  // ── Load / Save chat history from localStorage ────────────────────────────────
+  useEffect(() => {
+    if (!activeDocumentId) {
+      setMessages([
+        {
+          id: 1,
+          role: "assistant",
+          content:
+            "Hi, I can answer questions from uploaded real estate brochures using Hybrid Multimodal RAG. Select a document and ask about amenities, floor plans, RERA, pricing, possession dates, or location — I'll cite my sources.",
+        },
+      ]);
+      return;
+    }
+
+    const stored = localStorage.getItem(`chat_history_${activeDocumentId}`);
+    if (stored) {
+      try {
+        setMessages(JSON.parse(stored));
+      } catch (err) {
+        console.error("Failed to parse stored chat history:", err);
+      }
+    } else {
+      setMessages([
+        {
+          id: 1,
+          role: "assistant",
+          content:
+            "Hi, I can answer questions from uploaded real estate brochures using Hybrid Multimodal RAG. Select a document and ask about amenities, floor plans, RERA, pricing, possession dates, or location — I'll cite my sources.",
+        },
+      ]);
+    }
+  }, [activeDocumentId]);
+
+  useEffect(() => {
+    if (activeDocumentId && messages.length > 0) {
+      localStorage.setItem(`chat_history_${activeDocumentId}`, JSON.stringify(messages));
+    }
+  }, [messages, activeDocumentId]);
+
   // ── Poll document status ─────────────────────────────────────────────────────
   const pollStatus = useCallback(async (docId: string) => {
     if (!docId) return;

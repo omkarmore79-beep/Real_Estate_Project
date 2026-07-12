@@ -133,6 +133,48 @@ def process_images(
             image_type = classify_image_type(page_text, image_id)
             caption = generate_caption(image_type, page_text, page_number)
 
+            if meta.get("domain") == "excavator":
+                payload_metadata = {
+                    "doc_id": meta.get("doc_id", document_id),
+                    "document_id": document_id,
+                    "doc_type": meta.get("doc_type", ""),
+                    "title": meta.get("title", ""),
+                    "source_file": source_file,
+                    "revision_date": meta.get("revision_date", ""),
+                    "ingested_at": meta.get("ingested_at", ""),
+                    "page_number": page_number,
+                    "section_path": meta.get("section_path", ""),
+                    "machine_model": meta.get("machine_model", "R215L"),
+                    "component_tags": meta.get("component_tags", []),
+                    "dtc_codes": meta.get("dtc_codes", []),
+                    "supersedes_doc_id": meta.get("supersedes_doc_id", ""),
+                    "confidence_weight": meta.get("confidence_weight", 1.0),
+                    "domain": "excavator",
+                    "image_id": image_id,
+                    "image_path": image_path,
+                    "image_url": image_url,
+                    "image_type": image_type,
+                    "caption": caption,
+                    "nearby_text": page_text[:500],
+                    "ocr_context": ocr_text[:500],
+                }
+            else:
+                payload_metadata = {
+                    "document_id": document_id,
+                    "page_number": page_number,
+                    "image_id": image_id,
+                    "image_path": image_path,
+                    "image_url": image_url,
+                    "image_type": image_type,
+                    "caption": caption,
+                    "source_file": source_file,
+                    "project": meta.get("project_name", meta.get("project", "")),
+                    "builder": meta.get("builder", ""),
+                    "document_type": meta.get("document_type", ""),
+                    "nearby_text": page_text[:500],
+                    "ocr_context": ocr_text[:500],
+                }
+
             records.append(
                 {
                     "image_id": image_id,
@@ -149,21 +191,7 @@ def process_images(
                     "image_type": image_type,
                     "caption": caption,
                     "vector": [],  # filled by embedding service
-                    "metadata": {
-                        "document_id": document_id,
-                        "page_number": page_number,
-                        "image_id": image_id,
-                        "image_path": image_path,
-                        "image_url": image_url,
-                        "image_type": image_type,
-                        "caption": caption,
-                        "source_file": source_file,
-                        "project": meta.get("project_name", meta.get("project", "")),
-                        "builder": meta.get("builder", ""),
-                        "document_type": meta.get("document_type", ""),
-                        "nearby_text": page_text[:500],
-                        "ocr_context": ocr_text[:500],
-                    },
+                    "metadata": payload_metadata,
                 }
             )
 

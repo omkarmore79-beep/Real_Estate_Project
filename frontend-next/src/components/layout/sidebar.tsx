@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useState, useEffect } from "react";
+import Cookies from "js-cookie";
 import {
   Building2,
   BotMessageSquare,
@@ -30,6 +32,12 @@ const navigation = [
 
 export function Sidebar({ setOpen }: { setOpen?: (open: boolean) => void }) {
   const pathname = usePathname();
+  const [domain, setDomain] = useState("real-estate");
+
+  useEffect(() => {
+    const savedDomain = Cookies.get("domain");
+    if (savedDomain) setDomain(savedDomain);
+  }, [pathname]); // Refresh when navigation happens
 
   return (
     <aside className="group flex h-full w-[72px] hover:w-72 flex-col overflow-hidden whitespace-nowrap rounded-2xl border border-white/50 bg-white/20 backdrop-blur-md shadow-[8px_8px_32px_rgba(0,0,0,0.05)] transition-all duration-300 ease-in-out">
@@ -47,6 +55,15 @@ export function Sidebar({ setOpen }: { setOpen?: (open: boolean) => void }) {
         {navigation.map((item) => {
           const Icon = item.icon;
           const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
+          
+          let displayLabel = item.label;
+          if (item.label === "Builders" && domain === "machinery") {
+            displayLabel = "Manufacturers";
+          }
+          if (item.label === "Projects" && domain === "machinery") {
+            displayLabel = "Manuals";
+          }
+          
           return (
             <Link
               key={item.href}
@@ -59,7 +76,7 @@ export function Sidebar({ setOpen }: { setOpen?: (open: boolean) => void }) {
             >
               <Icon className="h-5 w-5 shrink-0" />
               <span className="opacity-0 transition-opacity duration-300 group-hover:opacity-100">
-                {item.label}
+                {displayLabel}
               </span>
             </Link>
           );

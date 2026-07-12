@@ -103,7 +103,7 @@ def _save_project_locally(project):
         return None
 
 
-def _load_projects_locally(document_id=None, include_raw_text=False):
+def _load_projects_locally(document_id=None, domain="real-estate", include_raw_text=False):
     """Load documents from backend/storage/local_documents.json."""
     from config import BASE_DIR
     local_file = os.path.join(BASE_DIR, "storage", "local_documents.json")
@@ -123,6 +123,16 @@ def _load_projects_locally(document_id=None, include_raw_text=False):
     for p in projects:
         if document_id and p.get("document_id") != document_id:
             continue
+            
+        # Domain filtering logic
+        p_domain = p.get("metadata", {}).get("domain")
+        if not document_id:
+            if domain == "real-estate":
+                if p_domain and p_domain != "real-estate":
+                    continue
+            elif p_domain != domain:
+                continue
+            
         item = dict(p)
         if not include_raw_text:
             item.pop("raw_text", None)
@@ -341,11 +351,21 @@ def load_file_from_mongo(document_id, file_kind, image_id=None):
     return None
 
 
-def load_projects_from_mongo(document_id=None, include_raw_text=False):
+def load_projects_from_mongo(document_id=None, domain="real-estate", include_raw_text=False):
     try:
         collection = _get_collection()
         if collection is not None:
-            query = {"document_id": document_id} if document_id else {}
+            query = {}
+            if document_id:
+                query["document_id"] = document_id
+            
+            # Domain filtering logic
+            if not document_id:
+                if domain == "real-estate":
+                    query["$or"] = [{"metadata.domain": "real-estate"}, {"metadata.domain": {"$exists": False}}]
+                else:
+                    query["metadata.domain"] = domain
+                
             projection = None if include_raw_text else {"raw_text": 0}
             return [
                 _serialize_document(item)
@@ -356,7 +376,7 @@ def load_projects_from_mongo(document_id=None, include_raw_text=False):
     return None
 
 
-def load_projects_from_json(document_id=None, include_raw_text=False):
+def load_projects_from_json(document_id=None, domain="real-estate", include_raw_text=False):
     data = []
     if not os.path.exists(DATA_FOLDER):
         return data
@@ -375,6 +395,15 @@ def load_projects_from_json(document_id=None, include_raw_text=False):
         if document_id and project.get("document_id") != document_id:
             continue
 
+        # Domain filtering logic
+        p_domain = project.get("metadata", {}).get("domain")
+        if not document_id:
+            if domain == "real-estate":
+                if p_domain and p_domain != "real-estate":
+                    continue
+            elif p_domain != domain:
+                continue
+
         if not include_raw_text:
             project.pop("raw_text", None)
 
@@ -383,13 +412,14 @@ def load_projects_from_json(document_id=None, include_raw_text=False):
     return data
 
 
-def load_projects(document_id=None, include_raw_text=False):
+def load_projects(document_id=None, domain="real-estate", include_raw_text=False):
     from config import ALLOW_UPLOAD_WITHOUT_MONGODB
     
     # Try MongoDB
     try:
         mongo_projects = load_projects_from_mongo(
-            document_id,
+            document_id=document_id,
+            domain=domain,
             include_raw_text=include_raw_text,
         )
         if mongo_projects is not None:
@@ -399,27 +429,32 @@ def load_projects(document_id=None, include_raw_text=False):
 
     # Try local storage fallback if allowed
     if ALLOW_UPLOAD_WITHOUT_MONGODB:
-        local_projects = _load_projects_locally(document_id, include_raw_text)
-        if local_projects:
+        local_projects = _load_projects_locally(document_id=document_id, domain=domain, include_raw_text=include_raw_text)
+        if local_projects is not None and len(local_projects) > 0:
             return local_projects
 
     # Legacy JSON fallback
-    return load_projects_from_json(document_id, include_raw_text=include_raw_text)
+    return load_projects_from_json(document_id=document_id, domain=domain, include_raw_text=include_raw_text)
 
 
 
-def load_builders():
-    projects = load_projects()
+def load_builders(domain="real-estate"):
+    projects = load_projects(domain=domain)
     builders = {}
 
     for project in projects:
         metadata = project.get("metadata") or {}
+        
+        # If in machinery domain, fall back to "Manufacturer not specified" 
+        # instead of "Builder not specified"
+        fallback_name = "Manufacturer not specified" if domain == "machinery" else "Builder not specified"
+        
         name = (
             metadata.get("builder")
             or project.get("developer")
-            or "Builder not specified"
+            or fallback_name
         )
-        key = str(name).strip() or "Builder not specified"
+        key = str(name).strip() or fallback_name
 
         if key not in builders:
             builders[key] = {

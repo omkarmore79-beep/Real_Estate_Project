@@ -166,6 +166,10 @@ class ImageEmbedder:
         with torch.no_grad():
             inputs = self._processor(text=texts, return_tensors="pt", padding=True, truncation=True)
             features = self._model.get_text_features(**inputs)
+            if hasattr(features, "text_embeds"):
+                features = features.text_embeds
+            elif not isinstance(features, torch.Tensor):
+                features = features[0]
             features = features / features.norm(dim=-1, keepdim=True)
         return _to_list(features)
 
@@ -198,6 +202,10 @@ class ImageEmbedder:
         with torch.no_grad():
             inputs = self._processor(images=images, return_tensors="pt")
             features = self._model.get_image_features(**inputs)
+            if hasattr(features, "image_embeds"):
+                features = features.image_embeds
+            elif not isinstance(features, torch.Tensor):
+                features = features[0]
             features = features / features.norm(dim=-1, keepdim=True)
         return _to_list(features)
 

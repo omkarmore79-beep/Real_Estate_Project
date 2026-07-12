@@ -101,15 +101,12 @@ export type DocumentStatus = {
   error?: string;
 };
 
-
-import { cookies } from "next/headers";
+// ── API helpers ────────────────────────────────────────────────────────────────
 
 export const backendBaseUrl = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
 
-export async function getUploadedProjects(): Promise<UploadedProject[]> {
+export async function getUploadedProjects(domain: string = "real-estate"): Promise<UploadedProject[]> {
   try {
-    const cookieStore = cookies();
-    const domain = cookieStore.get("domain")?.value || "real-estate";
     const response = await fetch(`${backendBaseUrl}/projects?domain=${domain}`, { cache: "no-store" });
     if (!response.ok) return [];
     const data = await response.json();
@@ -119,10 +116,8 @@ export async function getUploadedProjects(): Promise<UploadedProject[]> {
   }
 }
 
-export async function getBuilderGroups(): Promise<BuilderGroup[]> {
+export async function getBuilderGroups(domain: string = "real-estate"): Promise<BuilderGroup[]> {
   try {
-    const cookieStore = cookies();
-    const domain = cookieStore.get("domain")?.value || "real-estate";
     const response = await fetch(`${backendBaseUrl}/builders?domain=${domain}`, { cache: "no-store" });
     if (!response.ok) return [];
     const data = await response.json();

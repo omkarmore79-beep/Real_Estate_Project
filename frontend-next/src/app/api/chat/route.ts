@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import type { Citation, ImageResult } from "@/lib/backend-data";
 
 type BackendChatResponse = {
@@ -36,6 +37,9 @@ export async function POST(request: Request) {
   const documentId = typeof body?.documentId === "string" ? body.documentId : (body?.document_id ?? "");
   const includeImages = Boolean(body?.include_images ?? true);
   const topK = Number(body?.top_k ?? 8);
+  
+  const cookieStore = cookies();
+  const domain = cookieStore.get("domain")?.value || "real-estate";
 
   if (!message) {
     return NextResponse.json({ error: "Message is required." }, { status: 400 });
@@ -46,6 +50,7 @@ export async function POST(request: Request) {
       message,
       include_images: includeImages,
       top_k: topK,
+      domain,
     };
     if (documentId) {
       backendBody.document_id = documentId;

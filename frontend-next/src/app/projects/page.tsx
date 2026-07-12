@@ -1,20 +1,24 @@
 import Link from "next/link";
 import { Edit, FileText, MapPin, Plus } from "lucide-react";
+import { cookies } from "next/headers";
 import { Badge, ButtonLink, PageHeader } from "@/components/ui";
 import { getBuilderName, getProjectTitle, getUploadedProjects } from "@/lib/backend-data";
 
 export default async function ProjectsPage() {
-  const projects = await getUploadedProjects();
+  const cookieStore = cookies();
+  const domain = cookieStore.get("domain")?.value || "real-estate";
+  const projects = await getUploadedProjects(domain);
+  const isMachinery = domain === "machinery";
 
   return (
     <>
       <PageHeader
-        title="Projects"
-        description="Project records created from uploaded real estate documents."
+        title={isMachinery ? "Manuals" : "Projects"}
+        description={isMachinery ? "Technical manuals and guides uploaded to the knowledge base." : "Project records created from uploaded real estate documents."}
         action={
           <ButtonLink href="/documents/upload">
             <Plus className="h-4 w-4" />
-            Upload project
+            Upload {isMachinery ? "manual" : "project"}
           </ButtonLink>
         }
       />

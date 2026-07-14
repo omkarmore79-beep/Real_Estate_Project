@@ -33,6 +33,7 @@ _IMAGE_INTENT_PHRASES = (
     "inside view", "room view",
     "parking plan", "parking layout",
     "show", "image", "photo", "picture", "display", "view", "layout",
+    "diagram", "schematic", "cross-section", "cross section", "blueprint", "circuit"
 )
 
 _IMAGE_TYPE_MAP = {
@@ -42,33 +43,19 @@ _IMAGE_TYPE_MAP = {
     "amenity": "amenity", "amenities": "amenity",
     "elevation": "exterior", "building view": "exterior",
     "exterior": "exterior", "interior": "interior",
+    "diagram": "diagram", "schematic": "diagram", "cross-section": "diagram"
 }
 
 # ── RRF constant ───────────────────────────────────────────────────────────────
 RRF_K = 60
 
-# ── Reranker singleton ─────────────────────────────────────────────────────────
-_reranker = None
-
-def _get_reranker():
-    """Lazy-load the BGE reranker cross-encoder."""
-    global _reranker
-    if _reranker is None:
-        from config import RERANKER_MODEL
-        logger.info("Loading reranker model: %s …", RERANKER_MODEL)
-        try:
-            from FlagEmbedding import FlagReranker
-            _reranker = FlagReranker(RERANKER_MODEL, use_fp16=False)
-            logger.info("Reranker loaded (FlagEmbedding).")
-        except Exception as exc:
-            logger.warning("FlagEmbedding reranker failed (%s), trying sentence-transformers CrossEncoder: %s", RERANKER_MODEL, exc)
-            from sentence_transformers import CrossEncoder
-            _reranker = CrossEncoder(RERANKER_MODEL, max_length=512)
-            logger.info("Reranker loaded (CrossEncoder).")
-    return _reranker
-
+# ── Reranker status ────────────────────────────────────────────────────────────
 def reranker_status() -> dict:
-    return {"loaded": _reranker is not None}
+    from config import VOYAGE_API_KEY, VOYAGE_RERANK_MODEL
+    return {
+        "loaded": VOYAGE_API_KEY is not None and len(VOYAGE_API_KEY) > 0,
+        "model": VOYAGE_RERANK_MODEL
+    }
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  Public API
@@ -80,6 +67,7 @@ def retrieve(
     project_name: str | None = None,
     builder: str | None = None,
     document_type: str | None = None,
+    domain: str | None = None,
     include_images: bool = False,
     top_k: int = 8,
 ) -> list[dict]:
@@ -114,6 +102,52 @@ def retrieve(
         text_filters["builder"] = builder
     if document_type:
         text_filters["document_type"] = document_type
+    if domain and domain == "excavator":
+        text_filters["domain"] = domain
+        image_filters["domain"] = domain
+
+    # Resolve dynamic collection names for excavator
+    target_text_col = None
+    target_img_col = None
+
+    if domain == "excavator":
+        target_text_col = "im_manuals_text"
+        target_img_col = "im_manuals_images"
+
+        # Apply exact DTC code and component tag pre-filtering from the query router
+        try:
+            from chatbot.query_router import classify_im_query
+            routing_info = classify_im_query(query)
+            dtc_list = [c.strip() for c in routing_info.get("dtc_codes", []) if c.strip()]
+            comp_list = [c.strip() for c in routing_info.get("components", []) if c.strip()]
+            if dtc_list:
+                text_filters["dtc_codes"] = dtc_list
+                image_filters["dtc_codes"] = dtc_list
+            if comp_list:
+                text_filters["component_tags"] = comp_list
+                image_filters["component_tags"] = comp_list
+        except Exception as e:
+            logger.warning("Query routing classification failed in retriever: %s", e)
+
+        if document_id:
+            try:
+                from storage.mongo_client import load_projects
+                projects = load_projects(document_id=document_id, domain=domain)
+                if projects:
+                    meta = projects[0].get("metadata", {})
+                    doc_type = meta.get("doc_type")
+                    if doc_type == "manuals":
+                        target_text_col = "im_manuals_text"
+                    elif doc_type == "service_bulletins":
+                        target_text_col = "im_service_bulletins"
+                    elif doc_type == "maintenance_logs":
+                        target_text_col = "im_maintenance_logs"
+                    elif doc_type == "parts_catalog":
+                        target_text_col = "im_parts_catalog"
+                    elif doc_type == "field_reports":
+                        target_text_col = "im_field_reports"
+            except Exception as e:
+                logger.warning("Failed to resolve excavator collection name: %s", e)
 
     # Detect intent
     image_intent = detect_image_intent(query)
@@ -126,20 +160,34 @@ def retrieve(
     all_dense_results = []
     all_keyword_results = []
 
-    # 2. Run Dense + Sparse Search for each query variation
+    # 2. Run Dense + Sparse Search for each query variation (Retrieve Top 50 candidates)
     text_embedder = get_text_embedder()
+    has_strict_filters = bool(text_filters.get("dtc_codes") or text_filters.get("component_tags"))
+    
     for q_var in queries:
         # A. Dense text search
         try:
-            query_vec = text_embedder.embed(q_var)
-            dense_res = search_text_dense(query_vec, text_filters or None, top_k=top_k * 2)
+            query_vec = text_embedder.embed(q_var, input_type="query")
+            dense_res = search_text_dense(query_vec, text_filters or None, top_k=50, collection_name=target_text_col)
+            
+            # Fallback if strict filter returned nothing
+            if not dense_res and has_strict_filters:
+                backup_filters = {k: v for k, v in text_filters.items() if k not in ("dtc_codes", "component_tags")}
+                dense_res = search_text_dense(query_vec, backup_filters or None, top_k=50, collection_name=target_text_col)
+                
             all_dense_results.append(dense_res)
         except Exception as exc:
             logger.warning("Dense text search failed for variation '%s': %s", q_var, exc)
 
         # B. BM25 keyword search
         try:
-            keyword_res = search_text_keyword(q_var, text_filters or None, top_k=top_k * 2)
+            keyword_res = search_text_keyword(q_var, text_filters or None, top_k=50, collection_name=target_text_col)
+            
+            # Fallback if strict filter returned nothing
+            if not keyword_res and has_strict_filters:
+                backup_filters = {k: v for k, v in text_filters.items() if k not in ("dtc_codes", "component_tags")}
+                keyword_res = search_text_keyword(q_var, backup_filters or None, top_k=50, collection_name=target_text_col)
+                
             all_keyword_results.append(keyword_res)
         except Exception as exc:
             logger.warning("BM25 keyword search failed for variation '%s': %s", q_var, exc)
@@ -149,26 +197,49 @@ def retrieve(
     if should_search_images:
         try:
             img_embedder = get_image_embedder()
-            img_query_vec = img_embedder.embed_text(query)
-            image_results = search_images(
+            img_query_vec = img_embedder.embed_text(query, input_type="query")
+            image_res = search_images(
                 img_query_vec,
                 image_filters or None,
                 top_k=6,
+                collection_name=target_img_col
             )
+            
+            # Fallback if strict filter returned nothing
+            if not image_res and has_strict_filters:
+                backup_filters = {k: v for k, v in image_filters.items() if k not in ("dtc_codes", "component_tags")}
+                image_res = search_images(
+                    img_query_vec,
+                    backup_filters or None,
+                    top_k=6,
+                    collection_name=target_img_col
+                )
+            image_results = image_res
         except Exception as exc:
             logger.warning("Image search failed: %s", exc)
 
     # 4. RRF fusion across all variations and dense/sparse lists
     all_lists = all_dense_results + all_keyword_results
     text_fused = _rrf_fuse(all_lists)
+    
+    from config import RERANK_TOP_K, FINAL_TOP_K
+    
+    # Keep Top RERANK_TOP_K candidates for reranking
+    text_fused = text_fused[:RERANK_TOP_K]
+    
     all_results = _merge_text_and_image(text_fused, image_results, image_intent)
 
-    # 5. Reranking using Cross-Encoder against the original query
+    # 5. Reranking against the original query
     text_only = [r for r in all_results if r.get("source_type") == "text"]
     image_only = [r for r in all_results if r.get("source_type") == "image"]
 
+    target_top_k = top_k or FINAL_TOP_K
+
     if len(text_only) > 1:
-        text_only = _rerank(query, text_only)
+        text_only = _rerank(query, text_only, top_k=target_top_k)
+
+    # Rerank target_top_k
+    text_only = text_only[:target_top_k]
 
     # 6. Confidence Filtering
     # Filter text candidates whose confidence score is below 0.35
@@ -297,31 +368,12 @@ def _merge_text_and_image(
     return merged
 
 
-def _rerank(query: str, results: list[dict]) -> list[dict]:
+def _rerank(query: str, results: list[dict], top_k: int = 10) -> list[dict]:
     """
-    Rerank results using BAAI/bge-reranker-large cross-encoder.
+    Rerank results using Voyage Hosted Reranker.
     """
-    try:
-        reranker = _get_reranker()
-        pairs = [(query, r.get("content", "")[:512]) for r in results]
-
-        try:
-            from FlagEmbedding import FlagReranker
-            if isinstance(reranker, FlagReranker):
-                scores = reranker.compute_score(pairs, normalize=True)
-            else:
-                scores = reranker.predict(pairs).tolist()
-        except Exception:
-            scores = reranker.predict(pairs).tolist()
-
-        for i, result in enumerate(results):
-            result["rerank_score"] = float(scores[i]) if i < len(scores) else 0.0
-
-        results.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
-    except Exception as exc:
-        logger.warning("Reranking failed, using RRF order: %s", exc)
-
-    return results
+    from services.reranker import rerank_sync
+    return rerank_sync(query, results, top_k=top_k)
 
 
 def _interleave(

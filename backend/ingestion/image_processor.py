@@ -159,7 +159,7 @@ def process_images(
                     "ocr_context": ocr_text[:500],
                 }
             else:
-                payload_metadata = {
+                 payload_metadata = {
                     "document_id": document_id,
                     "page_number": page_number,
                     "image_id": image_id,
@@ -171,6 +171,7 @@ def process_images(
                     "project": meta.get("project_name", meta.get("project", "")),
                     "builder": meta.get("builder", ""),
                     "document_type": meta.get("document_type", ""),
+                    "domain": meta.get("domain", "real_estate"),
                     "nearby_text": page_text[:500],
                     "ocr_context": ocr_text[:500],
                 }

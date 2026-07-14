@@ -224,6 +224,7 @@ def chunk_text_pages(
                     "ocr_used": ocr_used,
                     "ocr_confidence": ocr_confidence,
                     "tags": tags,
+                    "domain": meta.get("domain", "real_estate"),
                     **re_details,
                 }
 

@@ -1,7 +1,7 @@
 {
   "/page": "app/page.js",
-  "/documents/upload/page": "app/documents/upload/page.js",
-  "/api/projects/route": "app/api/projects/route.js",
   "/chat/page": "app/chat/page.js",
-  "/api/documents/[document_id]/status/route": "app/api/documents/[document_id]/status/route.js"
+  "/api/projects/route": "app/api/projects/route.js",
+  "/api/documents/[document_id]/status/route": "app/api/documents/[document_id]/status/route.js",
+  "/api/chat/route": "app/api/chat/route.js"
 }

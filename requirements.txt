@@ -48,3 +48,4 @@ python-docx
 python-pptx
 openpyxl
 redis
+voyageai

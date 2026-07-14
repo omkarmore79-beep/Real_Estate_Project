@@ -27,7 +27,7 @@ def get_ocr_engine():
             from paddleocr import PaddleOCR
             # Suppress excessive logging from PaddleOCR
             logging.getLogger("ppocr").setLevel(logging.WARNING)
-            _ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+            _ocr_engine = PaddleOCR(lang="en")
             logger.info("PaddleOCR engine initialized successfully.")
         except Exception as exc:
             logger.error("Failed to initialize PaddleOCR engine: %s", exc)
@@ -85,7 +85,7 @@ def run_ocr_on_image(image_path_or_pil) -> OCRResult:
             return OCRResult("", 0.0, "paddle", ["Image preprocessing returned None"])
 
         # Execute PaddleOCR
-        result = engine.ocr(processed, cls=True)
+        result = engine.ocr(processed, cls=False)
         
         if not result or not result[0]:
             return OCRResult("", 1.0, "paddle", ["No text detected on the page image"])

@@ -1,40 +1,18 @@
 import Link from "next/link";
 import { Building2, Eye, FileText, FolderKanban, Search } from "lucide-react";
+import { cookies } from "next/headers";
 import { Badge, ButtonLink, PageHeader, StatCard } from "@/components/ui";
-
-type UploadedProject = {
-  document_id?: string;
-  project_name?: string;
-  developer?: string;
-  property_type?: string;
-  source_file?: string;
-  uploaded_at?: string;
-  metadata?: {
-    title?: string;
-    builder?: string;
-    document_type?: string;
-  };
-};
-
-async function getUploadedProjects(): Promise<UploadedProject[]> {
-  const backendBaseUrl = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
-
-  try {
-    const response = await fetch(`${backendBaseUrl}/projects`, { cache: "no-store" });
-    if (!response.ok) return [];
-    const data = await response.json();
-    return Array.isArray(data.projects) ? data.projects : [];
-  } catch {
-    return [];
-  }
-}
+import { getUploadedProjects, type UploadedProject } from "@/lib/backend-data";
 
 export default async function DashboardPage() {
-  const uploadedProjects = await getUploadedProjects();
+  const cookieStore = cookies();
+  const domain = cookieStore.get("domain")?.value || "real-estate";
+  const uploadedProjects = await getUploadedProjects(domain);
   const recentDocuments = uploadedProjects.slice(0, 4);
   const builderCount = new Set(
     uploadedProjects.map((project) => project.developer || project.metadata?.builder).filter(Boolean),
   ).size;
+  const isMachinery = domain === "machinery";
 
   return (
     <>

@@ -26,9 +26,9 @@ def get_mongo_client():
     
     return MongoClient(
         clean_uri,
-        serverSelectionTimeoutMS=30000,
-        connectTimeoutMS=30000,
-        socketTimeoutMS=30000,
+        serverSelectionTimeoutMS=2000,
+        connectTimeoutMS=2000,
+        socketTimeoutMS=2000,
         tls=True,
         tlsCAFile=certifi.where(),
         retryWrites=True,

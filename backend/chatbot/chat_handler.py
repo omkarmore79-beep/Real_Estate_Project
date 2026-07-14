@@ -245,9 +245,10 @@ def build_chat_context(projects, question):
     for project in projects:
         item = dict(project)
         raw_text = item.pop("raw_text", "")
+        pages_list = item.pop("pages", [])
         item["relevant_text_snippets"] = _extract_relevant_snippets(raw_text, question)
         item["relevant_page_metadata"] = _extract_relevant_pages(
-            item.get("pages", []),
+            pages_list,
             question,
         )
         context.append(item)

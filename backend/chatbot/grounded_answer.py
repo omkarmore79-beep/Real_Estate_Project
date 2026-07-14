@@ -20,16 +20,16 @@ from utils.evaluation import evaluate_rag_response
 logger = logging.getLogger(__name__)
 
 # ── Grounding system prompt ────────────────────────────────────────────────────
-_SYSTEM_PROMPT = """You are an expert real estate document analyst.
+_SYSTEM_PROMPT = """You are an expert technical document analyst and assistant.
 
 RULES — YOU MUST FOLLOW THESE EXACTLY:
 1. Answer ONLY using the provided retrieved context. Do NOT use any external or general knowledge.
 2. If the answer cannot be fully found in the retrieved context with high certainty, respond with EXACTLY:
-   "Insufficient evidence found."
-3. For every key claim (especially pricing, RERA numbers, possession dates, carpet area, amenities, or developer details), you must reference the source chunk/page.
+   "I couldn't find enough information in the uploaded manuals."
+3. For every key claim (especially specs, part numbers, values, clearances, torque figures), you must reference the source manual, page, section, and figure.
 4. NEVER invent, guess, or extrapolate. If details are missing, state that evidence is insufficient.
-5. If images are referenced in the context, refer to them by their image_id and image_type.
-6. Use plain text. Do not use Markdown headers. Keep responses concise and factual.
+5. If images/diagrams are referenced in the context, refer to them by their image_id, page, figure_number, and caption.
+6. Keep responses concise, factual, and strictly grounded.
 """
 
 def generate_grounded_answer(
@@ -47,7 +47,7 @@ def generate_grounded_answer(
     model = llm_model or _get_llm_model()
 
     # ── Separate text and image results ───────────────────────────────────────
-    text_results = [r for r in retrieved_results if r.get("source_type") == "text"]
+    text_results = [r for r in retrieved_results if r.get("source_type") == "text"][:5]
     image_results = [r for r in retrieved_results if r.get("source_type") == "image"]
 
     # ── Fallback: no retrieved context ─────────────────────────────────────────
@@ -70,7 +70,8 @@ def generate_grounded_answer(
 
 Question: {question}
 
-Answer based solely on the retrieved context above. If the answer is not fully supported, output "Insufficient evidence found."
+Answer based solely on the retrieved context above. If the answer is not fully supported, respond with EXACTLY:
+"I couldn't find enough information in the uploaded manuals."
 """
 
     answer_text = ""
@@ -192,6 +193,7 @@ def _is_insufficient(text: str) -> bool:
     lower = text.lower()
     markers = (
         "insufficient evidence",
+        "i couldn't find enough information",
         "data not available",
         "not found in",
         "not present in",
@@ -210,6 +212,10 @@ def _build_citations(text_results: list[dict]) -> list[dict]:
         content = (r.get("content") or "").strip()
         ocr_used = bool(r.get("ocr_used", meta.get("ocr_used", False)))
         source_type = r.get("source_type", meta.get("source_type", "pdf_text"))
+        
+        # Extract section
+        section = meta.get("section", meta.get("section_title", "General"))
+        
         citations.append(
             {
                 "citation_id": r.get("citation_id", ""),
@@ -217,10 +223,22 @@ def _build_citations(text_results: list[dict]) -> list[dict]:
                 "source_file": meta.get("source_file", ""),
                 "page_number": r.get("page_number") or meta.get("page_number"),
                 "source_type": source_type,
-                "section": meta.get("section_title", "General"),
+                "section": section,
                 "chunk_id": r.get("id", ""),
                 "builder": meta.get("builder", ""),
                 "project": meta.get("project", ""),
+                
+                # Excavator and Multimodal details
+                "doc_type": meta.get("doc_type", ""),
+                "machine_model": meta.get("machine_model", ""),
+                "component_tags": meta.get("component_tags", []),
+                "dtc_codes": meta.get("dtc_codes", []),
+                "section_path": meta.get("section_path", ""),
+                "figure_number": meta.get("figure_number", ""),
+                "image_id": meta.get("image_id", ""),
+                "version": meta.get("version", "1.0"),
+                "hash": meta.get("hash", ""),
+                "timestamp": meta.get("timestamp", ""),
                 "snippet": content[:300] if content else "",
                 "ocr_used": ocr_used,
             }
@@ -247,6 +265,11 @@ def _build_image_refs(image_results: list[dict]) -> list[dict]:
                 "page_number": r.get("page_number") or meta.get("page_number"),
                 "image_type": meta.get("image_type", "other"),
                 "caption": meta.get("caption", ""),
+                
+                # Additional diagram context
+                "figure_number": meta.get("figure_number", ""),
+                "section": meta.get("section", "General"),
+                "explanation": meta.get("surrounding_explanation", ""),
             }
         )
     return images
@@ -255,7 +278,7 @@ def _build_image_refs(image_results: list[dict]) -> list[dict]:
 def _insufficient_evidence_response(question: str) -> dict:
     return {
         "question": question,
-        "answer": "Insufficient evidence found.",
+        "answer": "I couldn't find enough information in the uploaded manuals.",
         "citations": [],
         "images": [],
         "confidence": "low",

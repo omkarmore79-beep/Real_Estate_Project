@@ -1,12 +1,12 @@
 """
-Embedding Service — lazy-loading text and image embedding models with caching.
+Embedding Service — Voyage AI Multimodal 3.5 Integration with local caching.
 
-Text embedder:  BAAI/bge-m3      → 1024-dim dense vectors
-Image embedder: jinaai/jina-clip-v2 (fallback: openai/clip-vit-base-patch32)
-                → 512-dim dense vectors (for both images and text captions)
+Uses voyage-multimodal-3.5:
+  - Text-to-Vector (1024 dimensions)
+  - Image-to-Vector (1024 dimensions)
+  - Interleaved Text + Image-to-Vector (1024 dimensions)
 
-Models are loaded lazily on first use so the FastAPI app starts instantly.
-All embedding runs are cached to Redis/local memory to optimize performance.
+All embeddings are cached to Redis/local memory.
 """
 
 from __future__ import annotations
@@ -14,55 +14,66 @@ from __future__ import annotations
 import logging
 import os
 import hashlib
-from typing import Union
+import time
+from typing import Any
+from PIL import Image
+
+from config import VOYAGE_API_KEY, TEXT_VECTOR_DIM, IMAGE_VECTOR_DIM
 
 logger = logging.getLogger(__name__)
 
-# ── Config (read from environment at import time) ──────────────────────────────
-from config import (
-    IMAGE_EMBEDDING_MODEL,
-    IMAGE_VECTOR_DIM,
-    TEXT_EMBEDDING_MODEL,
-    TEXT_VECTOR_DIM,
-)
+# ── Retry Helpers ─────────────────────────────────────────────────────────────
 
-_CLIP_FALLBACK_MODEL = "openai/clip-vit-base-patch32"
+def _multimodal_embed_with_retry(client, inputs, model, input_type, max_retries=5, initial_backoff=2.0):
+    backoff = initial_backoff
+    for attempt in range(max_retries):
+        try:
+            res = client.multimodal_embed(
+                inputs=inputs,
+                model=model,
+                input_type=input_type
+            )
+            return res
+        except Exception as exc:
+            err_msg = str(exc)
+            is_rate_limit = "429" in err_msg or "rate limit" in err_msg.lower() or "limit" in err_msg.lower() or "quota" in err_msg.lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                logger.warning("Voyage AI rate limit hit. Retrying in %.2fs (attempt %d/%d)...", backoff, attempt + 1, max_retries)
+                time.sleep(backoff)
+                backoff *= 2.0
+            else:
+                raise exc
+
+# ── Lazy Voyage client ────────────────────────────────────────────────────────
+_voyage_client = None
+
+def get_voyage_client():
+    global _voyage_client
+    if _voyage_client is None:
+        import voyageai
+        api_key = VOYAGE_API_KEY or os.getenv("VOYAGE_API_KEY")
+        if not api_key:
+            logger.warning("VOYAGE_API_KEY is not configured in .env. Voyage requests may fail.")
+        _voyage_client = voyageai.Client(api_key=api_key)
+    return _voyage_client
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Text Embedder — BAAI/bge-m3
+#  Text Embedder — voyage-multimodal-3.5
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TextEmbedder:
-    """Lazy wrapper around BAAI/bge-m3 FlagEmbedding model."""
+    """Voyage AI Multimodal 3.5 Text Embedder wrapper."""
 
-    def __init__(self, model_name: str = TEXT_EMBEDDING_MODEL):
+    def __init__(self, model_name: str = "voyage-multimodal-3.5"):
         self.model_name = model_name
-        self._model = None
 
-    def _load(self):
-        if self._model is not None:
-            return
-        logger.info("Loading text embedding model: %s (this may take a while…)", self.model_name)
-        try:
-            from FlagEmbedding import BGEM3FlagModel
-            self._model = BGEM3FlagModel(self.model_name, use_fp16=False)
-            logger.info("Text embedding model loaded: %s", self.model_name)
-        except Exception as exc:
-            logger.warning(
-                "FlagEmbedding load failed (%s), falling back to sentence-transformers: %s",
-                self.model_name,
-                exc,
-            )
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self.model_name, device="cpu")
-
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, input_type: str = "document") -> list[float]:
         """Embed a single text string, returns a list of floats."""
-        return self.embed_batch([text])[0]
+        return self.embed_batch([text], input_type=input_type)[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int = 16) -> list[list[float]]:
-        """Embed a batch of texts, returns list of float lists (cached)."""
+    def embed_batch(self, texts: list[str], batch_size: int = 16, input_type: str = "document") -> list[list[float]]:
+        """Embed a batch of texts using Voyage, with caching."""
         if not texts:
             return []
 
@@ -75,7 +86,7 @@ class TextEmbedder:
         # 1. Fetch from cache
         for idx, text in enumerate(texts):
             cleaned_text = text.strip() or " "
-            cache_key = f"emb:{self.model_name}:{cleaned_text}"
+            cache_key = f"emb:voyage-3.5:txt:{input_type}:{cleaned_text}"
             cached_vector = get_json_cache(cache_key)
             if cached_vector is not None:
                 results[idx] = cached_vector
@@ -85,35 +96,26 @@ class TextEmbedder:
 
         # 2. Embed missing items in batch
         if uncached_texts:
-            self._load()
-            embedded_vectors = []
+            client = get_voyage_client()
             try:
-                # FlagEmbedding path
-                from FlagEmbedding import BGEM3FlagModel
-                if isinstance(self._model, BGEM3FlagModel):
-                    output = self._model.encode(
-                        uncached_texts,
-                        batch_size=batch_size,
-                        max_length=512,
-                        return_dense=True,
-                        return_sparse=False,
-                        return_colbert_vecs=False,
-                    )
-                    embedded_vectors = output["dense_vecs"].tolist()
-            except Exception:
-                pass
-
-            if not embedded_vectors:
-                # sentence-transformers fallback
-                import numpy as np
-                vectors = self._model.encode(uncached_texts, batch_size=batch_size, show_progress_bar=False)
-                embedded_vectors = vectors.tolist()
+                # Wrap each string in a list because Voyage multimodal expects List[List[Union[str, Image]]]
+                inputs = [[t] for t in uncached_texts]
+                res = _multimodal_embed_with_retry(
+                    client=client,
+                    inputs=inputs,
+                    model=self.model_name,
+                    input_type=input_type
+                )
+                embedded_vectors = res.embeddings
+            except Exception as exc:
+                logger.error("Voyage text embedding failed permanently after retries: %s. Raising exception to prevent zero vector pollution.", exc)
+                raise exc
 
             # 3. Populate results and write to cache
             for idx, vec in zip(uncached_indices, embedded_vectors):
                 results[idx] = vec
                 cleaned_text = uncached_texts[uncached_indices.index(idx)]
-                cache_key = f"emb:{self.model_name}:{cleaned_text}"
+                cache_key = f"emb:voyage-3.5:txt:{input_type}:{cleaned_text}"
                 set_json_cache(cache_key, vec, expire_seconds=86400 * 30) # 30 days
 
         return results
@@ -124,106 +126,21 @@ class TextEmbedder:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Image Embedder — jinaai/jina-clip-v2 (with CLIP fallback)
+#  Image Embedder — voyage-multimodal-3.5
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ImageEmbedder:
-    """
-    Lazy wrapper for multimodal image+text embedding with caching.
+    """Voyage AI Multimodal 3.5 Image and Interleaved Embedder wrapper."""
 
-    Primary:  jinaai/jina-clip-v2
-    Fallback: openai/clip-vit-base-patch32
-    """
-
-    def __init__(self, model_name: str = IMAGE_EMBEDDING_MODEL):
+    def __init__(self, model_name: str = "voyage-multimodal-3.5"):
         self.model_name = model_name
-        self._model = None
-        self._processor = None
-        self._backend: str = "unknown"
 
-    def _load(self):
-        if self._model is not None:
-            return
+    def embed_text(self, text: str, input_type: str = "query") -> list[float]:
+        """Embed a text query/caption using Voyage multimodal model."""
+        return get_text_embedder().embed(text, input_type=input_type)
 
-        # Try jina-clip-v2 first
-        try:
-            logger.info("Loading image embedding model: %s …", self.model_name)
-            from transformers import AutoModel
-            self._model = AutoModel.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-            ).eval()
-            self._backend = "jina"
-            logger.info("Jina CLIP model loaded: %s", self.model_name)
-            return
-        except Exception as exc:
-            logger.warning(
-                "Failed to load %s (%s). Falling back to CLIP.", self.model_name, exc
-            )
-
-        # CLIP fallback
-        try:
-            from transformers import CLIPModel, CLIPProcessor
-            logger.info("Loading CLIP fallback: %s …", _CLIP_FALLBACK_MODEL)
-            self._model = CLIPModel.from_pretrained(_CLIP_FALLBACK_MODEL).eval()
-            self._processor = CLIPProcessor.from_pretrained(_CLIP_FALLBACK_MODEL)
-            self._backend = "clip"
-            logger.info("CLIP fallback model loaded.")
-        except Exception as exc:
-            logger.error("Both image embedding models failed to load: %s", exc)
-            raise
-
-    def embed_text(self, text: str) -> list[float]:
-        """Embed a text string using the image-text model (for caption/query search)."""
-        return self.embed_texts([text])[0]
-
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of text strings (cached)."""
-        if not texts:
-            return []
-
-        from utils.cache import get_json_cache, set_json_cache
-
-        results = [None] * len(texts)
-        uncached_indices = []
-        uncached_texts = []
-
-        for idx, text in enumerate(texts):
-            cleaned_text = text.strip() or " "
-            cache_key = f"emb:{self.model_name}:text:{cleaned_text}"
-            cached_vector = get_json_cache(cache_key)
-            if cached_vector is not None:
-                results[idx] = cached_vector
-            else:
-                uncached_indices.append(idx)
-                uncached_texts.append(cleaned_text)
-
-        if uncached_texts:
-            self._load()
-            import torch
-            embedded_vectors = []
-            if self._backend == "jina":
-                with torch.no_grad():
-                    vectors = self._model.encode_text(uncached_texts)
-                embedded_vectors = _to_list(vectors)
-            else:
-                # CLIP fallback
-                with torch.no_grad():
-                    inputs = self._processor(text=uncached_texts, return_tensors="pt", padding=True, truncation=True)
-                    features = self._model.get_text_features(**inputs)
-                    features = features / features.norm(dim=-1, keepdim=True)
-                embedded_vectors = _to_list(features)
-
-            for idx, vec in zip(uncached_indices, embedded_vectors):
-                results[idx] = vec
-                cleaned_text = uncached_texts[uncached_indices.index(idx)]
-                cache_key = f"emb:{self.model_name}:text:{cleaned_text}"
-                set_json_cache(cache_key, vec, expire_seconds=86400 * 30)
-
-        return results
-
-    def embed_image_file(self, image_path: str) -> list[float] | None:
-        """Embed an image from a file path. Returns None if file missing. (cached by SHA-256)"""
+    def embed_image_file(self, image_path: str, input_type: str = "document") -> list[float] | None:
+        """Embed an image file from path using Voyage, with caching."""
         if not image_path or not os.path.exists(image_path):
             return None
 
@@ -236,7 +153,7 @@ class ImageEmbedder:
                 while chunk := f.read(8192):
                     sha256.update(chunk)
             img_hash = sha256.hexdigest()
-            cache_key = f"emb:{self.model_name}:img:{img_hash}"
+            cache_key = f"emb:voyage-3.5:img:{input_type}:{img_hash}"
             
             cached_vector = get_json_cache(cache_key)
             if cached_vector is not None:
@@ -246,35 +163,84 @@ class ImageEmbedder:
             cache_key = None
 
         try:
-            from PIL import Image
             img = Image.open(image_path).convert("RGB")
-            vec = self.embed_images([img])[0]
+            client = get_voyage_client()
+            res = _multimodal_embed_with_retry(
+                client=client,
+                inputs=[[img]],
+                model=self.model_name,
+                input_type=input_type
+            )
+            vec = res.embeddings[0]
             if vec and cache_key:
                 set_json_cache(cache_key, vec, expire_seconds=86400 * 30)
             return vec
         except Exception as exc:
-            logger.warning("Failed to embed image %s: %s", image_path, exc)
+            logger.warning("Failed to embed image %s using Voyage: %s. Returning None for text fallback.", image_path, exc)
             return None
 
-    def embed_images(self, images) -> list[list[float]]:
+    def embed_interleaved(self, text: str, image_path: str, input_type: str = "document") -> list[float]:
+        """Embed an interleaved text context and image together as a single multimodal vector."""
+        if not image_path or not os.path.exists(image_path):
+            # Fallback to plain text embedding
+            return get_text_embedder().embed(text, input_type=input_type)
+
+        from utils.cache import get_json_cache, set_json_cache
+        
+        try:
+            # Hash text + image content
+            sha256 = hashlib.sha256()
+            sha256.update(text.encode("utf-8"))
+            with open(image_path, "rb") as f:
+                while chunk := f.read(8192):
+                    sha256.update(chunk)
+            combined_hash = sha256.hexdigest()
+            cache_key = f"emb:voyage-3.5:interleaved:{input_type}:{combined_hash}"
+            
+            cached_vector = get_json_cache(cache_key)
+            if cached_vector is not None:
+                return cached_vector
+        except Exception:
+            combined_hash = None
+            cache_key = None
+
+        try:
+            img = Image.open(image_path).convert("RGB")
+            client = get_voyage_client()
+            # Voyage expects interleaved input inside list: [[text, PIL_image]]
+            res = _multimodal_embed_with_retry(
+                client=client,
+                inputs=[[text, img]],
+                model=self.model_name,
+                input_type=input_type
+            )
+            vec = res.embeddings[0]
+            if vec and cache_key:
+                set_json_cache(cache_key, vec, expire_seconds=86400 * 30)
+            return vec
+        except Exception as exc:
+            logger.warning("Failed to embed interleaved content for %s: %s. Falling back to text-only.", image_path, exc)
+            # Fallback to text embedding
+            return get_text_embedder().embed(text, input_type=input_type)
+
+    def embed_images(self, images: list[Image.Image], input_type: str = "document") -> list[list[float]]:
         """Embed a batch of PIL images."""
-        self._load()
         if not images:
             return []
 
-        import torch
-
-        if self._backend == "jina":
-            with torch.no_grad():
-                vectors = self._model.encode_image(images)
-            return _to_list(vectors)
-
-        # CLIP fallback
-        with torch.no_grad():
-            inputs = self._processor(images=images, return_tensors="pt")
-            features = self._model.get_image_features(**inputs)
-            features = features / features.norm(dim=-1, keepdim=True)
-        return _to_list(features)
+        client = get_voyage_client()
+        try:
+            inputs = [[img] for img in images]
+            res = _multimodal_embed_with_retry(
+                client=client,
+                inputs=inputs,
+                model=self.model_name,
+                input_type=input_type
+            )
+            return res.embeddings
+        except Exception as exc:
+            logger.error("Voyage batch image embedding failed permanently: %s. Raising exception to prevent zero vector pollution.", exc)
+            raise exc
 
     @property
     def dim(self) -> int:
@@ -282,7 +248,7 @@ class ImageEmbedder:
 
     @property
     def backend(self) -> str:
-        return self._backend
+        return "voyage-multimodal"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -308,33 +274,16 @@ def get_image_embedder() -> ImageEmbedder:
 
 
 def embedding_model_status() -> dict:
-    """Return current loading status of embedding models (for health endpoint)."""
-    text_loaded = _text_embedder is not None and _text_embedder._model is not None
-    image_loaded = _image_embedder is not None and _image_embedder._model is not None
+    """Return loading status of Voyage model."""
+    client_loaded = _voyage_client is not None
     return {
         "text_embedder": {
-            "model": TEXT_EMBEDDING_MODEL,
-            "loaded": text_loaded,
+            "model": "voyage-multimodal-3.5",
+            "loaded": client_loaded,
         },
         "image_embedder": {
-            "model": IMAGE_EMBEDDING_MODEL,
-            "loaded": image_loaded,
-            "backend": _image_embedder.backend if image_loaded else "not_loaded",
+            "model": "voyage-multimodal-3.5",
+            "loaded": client_loaded,
+            "backend": "voyage-multimodal",
         },
     }
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _to_list(tensor_or_array) -> list[list[float]]:
-    """Convert torch tensor or numpy array to a Python list of float lists."""
-    try:
-        import torch
-        if isinstance(tensor_or_array, torch.Tensor):
-            return tensor_or_array.detach().cpu().numpy().tolist()
-    except ImportError:
-        pass
-    import numpy as np
-    if isinstance(tensor_or_array, np.ndarray):
-        return tensor_or_array.tolist()
-    return list(tensor_or_array)

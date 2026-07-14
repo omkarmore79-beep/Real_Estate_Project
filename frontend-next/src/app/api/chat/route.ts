@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
 import type { Citation, ImageResult } from "@/lib/backend-data";
 
 type BackendChatResponse = {
@@ -36,6 +37,16 @@ export async function POST(request: Request) {
   const documentId = typeof body?.documentId === "string" ? body.documentId : (body?.document_id ?? "");
   const includeImages = Boolean(body?.include_images ?? true);
   const topK = Number(body?.top_k ?? 8);
+  
+  const cookieStore = cookies();
+  const domain = cookieStore.get("domain")?.value || "real-estate";
+  
+  let sessionId = cookieStore.get("session_id")?.value;
+  let isNewSession = false;
+  if (!sessionId) {
+    sessionId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    isNewSession = true;
+  }
 
   if (!message) {
     return NextResponse.json({ error: "Message is required." }, { status: 400 });
@@ -46,6 +57,8 @@ export async function POST(request: Request) {
       message,
       include_images: includeImages,
       top_k: topK,
+      domain,
+      session_id: sessionId,
     };
     if (documentId) {
       backendBody.document_id = documentId;
@@ -70,7 +83,7 @@ export async function POST(request: Request) {
     // Resolve image URLs
     const resolvedImages = (data.images ?? []).map(resolveImage);
 
-    return NextResponse.json({
+    const resObj = NextResponse.json({
       question: data.question ?? message,
       answer: data.answer ?? "No answer returned.",
       images: resolvedImages,
@@ -79,6 +92,10 @@ export async function POST(request: Request) {
       intent: data.intent ?? {},
       retrieved_context: data.retrieved_context ?? [],
     });
+    if (isNewSession) {
+      resObj.cookies.set("session_id", sessionId, { maxAge: 86400 * 30 });
+    }
+    return resObj;
   } catch {
     return NextResponse.json(
       {

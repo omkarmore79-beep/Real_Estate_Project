@@ -40,9 +40,8 @@ def get_qdrant_client():
 
 def create_collections() -> dict[str, str]:
     """
-    Create text and image Qdrant collections if they do not already exist.
-
-    Returns a dict with collection names and their creation status.
+    Create text and image Qdrant collections if they do not already exist,
+    or recreate them if their vector dimensions do not match target configurations.
     """
     from qdrant_client.models import Distance, VectorParams
 
@@ -50,25 +49,58 @@ def create_collections() -> dict[str, str]:
     existing = {c.name for c in client.get_collections().collections}
     results: dict[str, str] = {}
 
-    if QDRANT_COLLECTION_TEXT not in existing:
-        client.create_collection(
-            collection_name=QDRANT_COLLECTION_TEXT,
-            vectors_config=VectorParams(size=TEXT_VECTOR_DIM, distance=Distance.COSINE),
-        )
-        logger.info("Created text collection: %s", QDRANT_COLLECTION_TEXT)
-        results[QDRANT_COLLECTION_TEXT] = "created"
-    else:
-        results[QDRANT_COLLECTION_TEXT] = "exists"
+    def verify_and_create(col_name: str, target_dim: int) -> str:
+        recreate = False
+        if col_name in existing:
+            try:
+                col_info = client.get_collection(col_name)
+                params = col_info.config.params.vectors
+                current_size = -1
+                if hasattr(params, "size"):
+                    current_size = params.size
+                elif isinstance(params, dict) and "size" in params:
+                    current_size = params["size"]
+                
+                if current_size != target_dim:
+                    logger.warning(
+                        "Collection %s exists with dimension %s but target is %d. Recreating...",
+                        col_name, str(current_size), target_dim
+                    )
+                    client.delete_collection(col_name)
+                    recreate = True
+            except Exception as e:
+                logger.warning("Failed to check collection config for %s: %s. Recreating...", col_name, e)
+                try:
+                    client.delete_collection(col_name)
+                except Exception:
+                    pass
+                recreate = True
 
-    if QDRANT_COLLECTION_IMAGES not in existing:
-        client.create_collection(
-            collection_name=QDRANT_COLLECTION_IMAGES,
-            vectors_config=VectorParams(size=IMAGE_VECTOR_DIM, distance=Distance.COSINE),
-        )
-        logger.info("Created image collection: %s", QDRANT_COLLECTION_IMAGES)
-        results[QDRANT_COLLECTION_IMAGES] = "created"
-    else:
-        results[QDRANT_COLLECTION_IMAGES] = "exists"
+        if col_name not in existing or recreate:
+            client.create_collection(
+                collection_name=col_name,
+                vectors_config=VectorParams(size=target_dim, distance=Distance.COSINE),
+            )
+            logger.info("Created collection: %s (dim=%d)", col_name, target_dim)
+            status = "created"
+        else:
+            status = "exists"
+            
+        try:
+            from qdrant_client.models import PayloadSchemaType
+            client.create_payload_index(
+                collection_name=col_name,
+                field_name="document_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            logger.info("Ensured payload index for document_id exists on collection: %s", col_name)
+        except Exception as e:
+            logger.warning("Failed to ensure payload index for document_id on %s: %s", col_name, e)
+            
+        return status
+
+    results[QDRANT_COLLECTION_TEXT] = verify_and_create(QDRANT_COLLECTION_TEXT, TEXT_VECTOR_DIM)
+    results[QDRANT_COLLECTION_IMAGES] = verify_and_create(QDRANT_COLLECTION_IMAGES, IMAGE_VECTOR_DIM)
 
     return results
 
@@ -165,13 +197,24 @@ def search_text_dense(
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
-    results = client.search(
-        collection_name=target,
-        query_vector=query_vector,
-        query_filter=qdrant_filter,
-        limit=top_k,
-        with_payload=True,
-    )
+    try:
+        # Modern Qdrant client query interface
+        res = client.query_points(
+            collection_name=target,
+            query=query_vector,
+            query_filter=qdrant_filter,
+            limit=top_k,
+        )
+        results = res.points
+    except (AttributeError, TypeError):
+        # Legacy fallback
+        results = client.search(
+            collection_name=target,
+            query_vector=query_vector,
+            query_filter=qdrant_filter,
+            limit=top_k,
+            with_payload=True,
+        )
     return _format_results(results)
 
 
@@ -237,13 +280,24 @@ def search_images(
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
-    results = client.search(
-        collection_name=target,
-        query_vector=query_vector,
-        query_filter=qdrant_filter,
-        limit=top_k,
-        with_payload=True,
-    )
+    try:
+        # Modern Qdrant client query interface
+        res = client.query_points(
+            collection_name=target,
+            query=query_vector,
+            query_filter=qdrant_filter,
+            limit=top_k,
+        )
+        results = res.points
+    except (AttributeError, TypeError):
+        # Legacy fallback
+        results = client.search(
+            collection_name=target,
+            query_vector=query_vector,
+            query_filter=qdrant_filter,
+            limit=top_k,
+            with_payload=True,
+        )
     return _format_results(results)
 
 

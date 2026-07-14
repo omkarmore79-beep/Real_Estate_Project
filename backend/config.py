@@ -71,14 +71,21 @@ if _is_cloud and not QDRANT_API_KEY:
         "QDRANT_API_KEY is required when connecting to Qdrant Cloud."
     )
 
+# ── Voyage AI ─────────────────────────────────────────────────────────────────
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+
 # ── Embedding & Reranker Models ────────────────────────────────────────────────
-TEXT_EMBEDDING_MODEL = os.getenv("TEXT_EMBEDDING_MODEL", "BAAI/bge-m3")
-IMAGE_EMBEDDING_MODEL = os.getenv("IMAGE_EMBEDDING_MODEL", "jinaai/jina-clip-v2")
+TEXT_EMBEDDING_MODEL = os.getenv("TEXT_EMBEDDING_MODEL", "voyage-multimodal-3.5")
+IMAGE_EMBEDDING_MODEL = os.getenv("IMAGE_EMBEDDING_MODEL", "voyage-multimodal-3.5")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
+VOYAGE_RERANK_MODEL = os.getenv("VOYAGE_RERANK_MODEL", "rerank-2")
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "50"))
+FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "10"))
+RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "30"))
 
 # Vector dimensions
-TEXT_VECTOR_DIM = int(os.getenv("TEXT_VECTOR_DIM", "1024"))   # bge-m3 dense dim
-IMAGE_VECTOR_DIM = int(os.getenv("IMAGE_VECTOR_DIM", "512"))  # jina-clip-v2 / CLIP
+TEXT_VECTOR_DIM = int(os.getenv("TEXT_VECTOR_DIM", "1024"))   # Voyage dense dim
+IMAGE_VECTOR_DIM = int(os.getenv("IMAGE_VECTOR_DIM", "1024"))  # Voyage multimodal dim
 
 # ── OCR ────────────────────────────────────────────────────────────────────────
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").lower() == "true"
@@ -104,7 +111,7 @@ print(f"ALLOW_UPLOAD_WITHOUT_MONGODB: {'true' if ALLOW_UPLOAD_WITHOUT_MONGODB el
 print(f"[CONFIG] LLM model          : {LLM_MODEL}")
 print(f"[CONFIG] Text embed model   : {TEXT_EMBEDDING_MODEL}")
 print(f"[CONFIG] Image embed model  : {IMAGE_EMBEDDING_MODEL}")
-print(f"[CONFIG] Reranker model     : {RERANKER_MODEL}")
+print(f"[CONFIG] Reranker model     : {VOYAGE_RERANK_MODEL}")
 
 
 

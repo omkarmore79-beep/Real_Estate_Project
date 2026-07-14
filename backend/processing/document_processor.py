@@ -354,9 +354,10 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
                 vec = None
                 if local_path and os.path.exists(local_path):
                     try:
-                        vec = img_embedder.embed_image_file(local_path)
+                        # Call Voyage multimodal interleaved embedding
+                        vec = img_embedder.embed_interleaved(embed_text, local_path)
                     except Exception as img_exc:
-                        logger.warning("[%s] Image embedding failed: %s. Using text fallback.", document_id, img_exc)
+                        logger.warning("[%s] Interleaved image embedding failed: %s. Using text fallback.", document_id, img_exc)
                 if vec is None:
                     vec = img_embedder.embed_text(embed_text)
                 record["vector"] = vec

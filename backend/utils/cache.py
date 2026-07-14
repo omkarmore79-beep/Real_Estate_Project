@@ -28,12 +28,14 @@ _memory_cache: dict[str, str] = {}
 # ── Redis Client Initialization ────────────────────────────────────────────────
 _redis_client: Any = None
 _redis_available = False
+_redis_initialized = False
 
 def get_redis_client():
-    global _redis_client, _redis_available
-    if _redis_client is not None:
+    global _redis_client, _redis_available, _redis_initialized
+    if _redis_initialized:
         return _redis_client if _redis_available else None
 
+    _redis_initialized = True
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", "6379"))
     redis_db = int(os.getenv("REDIS_DB", "0"))
@@ -44,9 +46,11 @@ def get_redis_client():
             host=redis_host,
             port=redis_port,
             db=redis_db,
-            socket_timeout=2.0,
-            socket_connect_timeout=2.0,
-            decode_responses=True
+            socket_timeout=1.0,
+            socket_connect_timeout=1.0,
+            decode_responses=True,
+            retry_on_timeout=False,
+            retry=None
         )
         # Test connection
         client.ping()

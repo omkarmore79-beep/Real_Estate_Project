@@ -49,35 +49,54 @@ def create_im_collections():
     logger.info("Initializing Hyundai R215L Qdrant Collections setup...")
     logger.info("Connecting to Qdrant URL: %s", QDRANT_URL)
 
-    existing = {c.name for c in client.get_collections().collections}
-    
-    # ── 1. Create Text Collections ─────────────────────────────────────────────
-    for col in TEXT_COLLECTIONS:
-        if col not in existing:
-            client.create_collection(
-                collection_name=col,
-                vectors_config=VectorParams(size=TEXT_VECTOR_DIM, distance=Distance.COSINE),
-            )
-            logger.info("Created text collection: %s (dim=%d)", col, TEXT_VECTOR_DIM)
-        else:
-            logger.info("Text collection %s already exists.", col)
-            
-        # Create Payload Indexes
-        create_payload_indexes(col)
+    existing_collections = client.get_collections().collections
+    existing = {c.name for c in existing_collections}
 
-    # ── 2. Create Image Collections ────────────────────────────────────────────
-    for col in IMAGE_COLLECTIONS:
-        if col not in existing:
+    def check_and_create_collection(col_name: str, target_dim: int):
+        recreate = False
+        if col_name in existing:
+            try:
+                col_info = client.get_collection(col_name)
+                # Inspect vectors config
+                params = col_info.config.params.vectors
+                current_size = -1
+                if hasattr(params, "size"):
+                    current_size = params.size
+                elif isinstance(params, dict) and "size" in params:
+                    current_size = params["size"]
+                
+                if current_size != target_dim:
+                    logger.warning(
+                        "Collection %s exists with dimension %s but target is %d. Recreating...",
+                        col_name, str(current_size), target_dim
+                    )
+                    client.delete_collection(col_name)
+                    recreate = True
+            except Exception as e:
+                logger.warning("Failed to check collection config for %s: %s. Recreating...", col_name, e)
+                try:
+                    client.delete_collection(col_name)
+                except Exception:
+                    pass
+                recreate = True
+
+        if col_name not in existing or recreate:
             client.create_collection(
-                collection_name=col,
-                vectors_config=VectorParams(size=IMAGE_VECTOR_DIM, distance=Distance.COSINE),
+                collection_name=col_name,
+                vectors_config=VectorParams(size=target_dim, distance=Distance.COSINE),
             )
-            logger.info("Created image collection: %s (dim=%d)", col, IMAGE_VECTOR_DIM)
+            logger.info("Created collection: %s (dim=%d)", col_name, target_dim)
+            create_payload_indexes(col_name)
         else:
-            logger.info("Image collection %s already exists.", col)
-            
-        # Create Payload Indexes
-        create_payload_indexes(col)
+            logger.info("Collection %s already exists with correct dimensions.", col_name)
+
+    # ── 1. Setup Text Collections ─────────────────────────────────────────────
+    for col in TEXT_COLLECTIONS:
+        check_and_create_collection(col, TEXT_VECTOR_DIM)
+
+    # ── 2. Setup Image Collections ────────────────────────────────────────────
+    for col in IMAGE_COLLECTIONS:
+        check_and_create_collection(col, IMAGE_VECTOR_DIM)
 
     logger.info("Excavator Qdrant Collections setup completed successfully.")
 

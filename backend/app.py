@@ -426,21 +426,69 @@ async def document_status(document_id: str):
 #  CHAT — Hybrid RAG with readiness guard and legacy fallback
 # ════════════════════════════════════════════════════════════════════════════════
 
+def route_query_with_llm(query: str) -> str:
+    """
+    LLM Router Node: Classifies query into 'chit_chat', 'real_estate', or 'visual_image'.
+    """
+    from chatbot.grounded_answer import _get_groq_client, _get_llm_model
+    client = _get_groq_client()
+    model = _get_llm_model()
+    
+    prompt = f"""You are an advanced routing assistant for a real estate chatbot.
+Classify the following user query into exactly one of three categories:
+1. 'chit_chat': If the query is a greeting, small talk, question about your identity, thank you, or general casual conversation (e.g., 'hi', 'hello', 'how are you', 'thank you', 'who made you').
+2. 'visual_image': If the query specifically requests images, diagrams, floor plans, layouts, site plans, photos, or maps (e.g., 'show me the floor plan', 'list of images', 'visual drawings', 'diagrams').
+3. 'real_estate': If the query asks for specific text details, specifications, RERA ID, prices, amenities, dates, developer details, or other brochure facts (e.g., 'what is the price', 'tell me about the amenities', 'RERA registration number').
+
+User Query: "{query}"
+
+Output ONLY the category name ('chit_chat', 'visual_image', or 'real_estate') in lowercase. Do not include any other text."""
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=10
+        )
+        decision = response.choices[0].message.content.strip().lower()
+        if "chit_chat" in decision or "chitchat" in decision:
+            return "chit_chat"
+        elif "visual" in decision or "image" in decision:
+            return "visual_image"
+        else:
+            return "real_estate"
+    except Exception as e:
+        logger.warning("LLM Routing failed, falling back to rule-based: %s", e)
+        # Fallback to rule-based check
+        q_lower = query.lower().strip()
+        greetings = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "howdy", "yo"}
+        small_talk_words = {"how are you", "who are you", "what is your name", "who made you", "tell me a joke", "what's up", "help", "thank you", "thanks", "bye", "goodbye"}
+        if q_lower in greetings or any(w in q_lower for w in small_talk_words):
+            return "chit_chat"
+        if any(w in q_lower for w in ["diagram", "image", "photo", "floor plan", "layout", "drawing", "map"]):
+            return "visual_image"
+        return "real_estate"
+
 @app.post("/chat")
 async def chat(query: Any = Body(...)):
     document_id = None
+    session_id = "default"
     top_k = 8
     include_images = False
     domain = "real_estate"
 
     if isinstance(query, dict):
         document_id = query.get("document_id")
+        session_id = query.get("session_id", "default")
         include_images = bool(query.get("include_images", False))
         top_k = int(query.get("top_k", 8))
         domain = query.get("domain", "real_estate")
-        query = query.get("message") or query.get("query") or ""
+        question = query.get("message") or query.get("query") or ""
+    else:
+        question = str(query)
 
-    question = str(query).strip()
+    question = str(question).strip()
     if not question:
         return {
             "question": "",
@@ -450,17 +498,73 @@ async def chat(query: Any = Body(...)):
             "confidence": "low",
         }
 
-    # ── Excavator Scaffolding Route ───────────────────────────────────────────
-    if domain == "excavator":
-        from chatbot.query_router import classify_im_query
-        routing_info = classify_im_query(question)
+    # 1. Load Session History
+    from utils.memory import memory_manager
+    session = memory_manager.get_session(session_id)
+    history = session.get_history()
+
+    # 2. Standalone query rewriting for follow-up questions
+    stand_alone_question = question
+    if history:
+        try:
+            from chatbot.grounded_answer import _get_groq_client
+            client = _get_groq_client()
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-4:]])
+            rewrite_prompt = f"""Given the following chat history and follow-up question, rewrite it into a single standalone search query.
+If it is already standalone, return it as is. Do not include prefix/suffix.
+
+Chat History:
+{history_str}
+
+Follow-up: {question}
+Standalone:"""
+            res = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": rewrite_prompt}],
+                temperature=0.1,
+                max_tokens=128
+            )
+            stand_alone_question = res.choices[0].message.content.strip()
+            logger.info("Rewrote follow-up question to standalone: %s", stand_alone_question)
+        except Exception as e:
+            logger.warning("Failed to rewrite query with history: %s", e)
+
+    # 3. LLM Router Node classification
+    route_decision = route_query_with_llm(stand_alone_question)
+    logger.info("LLM Router Node classified query as: %s", route_decision)
+
+    if route_decision == "chit_chat":
+        # Run Chit-Chat Node
+        from chatbot.grounded_answer import _get_groq_client, _get_llm_model
+        client = _get_groq_client()
+        model = _get_llm_model()
+        messages = [{"role": "system", "content": "You are a helpful, professional AI assistant. Reply to the user's greeting or question naturally and concisely."}]
+        for msg in history[-6:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": question})
+        
+        try:
+            res = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=256
+            )
+            answer = res.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error("Smalltalk LLM call failed: %s", e)
+            answer = "Hello! How can I help you today?"
+            
+        session.add_message("user", question)
+        session.add_message("assistant", answer)
+        
         return {
             "question": question,
-            "answer": f"[SCANNED ROUTE: {routing_info['category'].upper()}] - Scaffolding for Hyundai excavator RAG active.",
+            "answer": answer,
             "citations": [],
             "images": [],
             "confidence": "high",
-            "routing": routing_info,
+            "is_smalltalk": True,
         }
 
     # ── Guard: document must be ready ─────────────────────────────────────────
@@ -471,7 +575,7 @@ async def chat(query: Any = Body(...)):
             if status_val == "failed":
                 return {
                     "question": question,
-                    "answer": "Document processing failed. Please re-upload the brochure.",
+                    "answer": "Document processing failed. Please re-upload.",
                     "citations": [], "images": [], "confidence": "low", "status": "failed",
                 }
             progress = doc_status.get("progress", 0)
@@ -487,90 +591,122 @@ async def chat(query: Any = Body(...)):
                 "status": "processing", "progress": progress,
             }
 
-    # ── Intent detection ──────────────────────────────────────────────────────
-    intent = classify_intent(question)
-    image_intent = detect_image_intent(question)
+    # ── Intent override based on Router Node decision ─────────────────────────
+    intent = classify_intent(stand_alone_question)
+    image_intent = detect_image_intent(stand_alone_question)
+
+    if route_decision == "visual_image":
+        intent["requires_visual_response"] = True
+        image_intent["requires_image"] = True
+        logger.info("Visual Query: Routing to Image Retriever Node")
+    else:
+        intent["requires_visual_response"] = False
+        image_intent["requires_image"] = False
+        logger.info("Real Estate Query: Routing to Vector Retriever Node")
+
+    routing_info = None
+    if domain == "excavator":
+        try:
+            from chatbot.query_router import classify_im_query
+            routing_info = classify_im_query(stand_alone_question)
+        except Exception:
+            pass
 
     # ── Try Hybrid RAG ────────────────────────────────────────────────────────
     try:
         from utils.observability import time_stage
         with time_stage("total_response_times"):
             retrieved = retrieve(
-                query=question,
+                query=stand_alone_question,
                 document_id=document_id,
+                domain=domain,
                 include_images=include_images or intent.get("requires_visual_response", False),
                 top_k=top_k,
             )
             if retrieved:
-                rag_response = generate_grounded_answer(question, retrieved)
+                rag_response = generate_grounded_answer(stand_alone_question, retrieved)
                 rag_response["intent"] = {
                     **intent,
                     "requires_image": image_intent["requires_image"],
                     "requires_text": True,
                     "detected_image_types": image_intent.get("detected_types", []),
                 }
+                if routing_info:
+                    rag_response["routing"] = routing_info
+                    if domain == "excavator" and "answer" in rag_response:
+                        rag_response["answer"] = f"[SCANNED ROUTE: {routing_info['category'].upper()}] - {rag_response['answer']}"
+                
+                # Save RAG response to conversational memory
+                session.add_message("user", question)
+                session.add_message("assistant", rag_response["answer"])
+                
                 return rag_response
     except Exception as exc:
         logger.warning("RAG pipeline failed, falling back to legacy path: %s", exc)
 
     # ── Legacy fallback ───────────────────────────────────────────────────────
-    projects = load_projects(document_id=document_id, include_raw_text=True)
+    projects = load_projects(document_id=document_id, domain=domain, include_raw_text=True)
     if not projects:
-        return {
+        res_dict = {
             "question": question,
             "answer": "No project data found. Please upload a brochure first.",
             "citations": [], "images": [], "confidence": "low", "intent": intent,
         }
+    else:
+        matching_images = []
+        if intent["requires_visual_response"]:
+            matching_images = find_matching_images(
+                question, projects, allowed_image_types=intent.get("image_types", [])
+            )
+        matching_image_paths = [img["image_path"] for img in matching_images]
 
-    matching_images = []
-    if intent["requires_visual_response"]:
-        matching_images = find_matching_images(
-            question, projects, allowed_image_types=intent.get("image_types", [])
-        )
-    matching_image_paths = [img["image_path"] for img in matching_images]
+        local_answer = answer_from_project_data(question, projects)
+        if local_answer is not None:
+            answer = local_answer
+            if intent["requires_visual_response"] and matching_images:
+                if should_prioritize_image(question) or "Data not available" in local_answer:
+                    answer = image_answer_text(question, matching_images) or local_answer
+                else:
+                    answer = f"{local_answer}\n\nRelated image attached."
+            res_dict = {
+                "question": question, "answer": answer,
+                "citations": [], "images": matching_image_paths,
+                "confidence": "medium",
+                "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
+            }
+        elif intent["requires_visual_response"] and matching_images:
+            res_dict = {
+                "question": question,
+                "answer": image_answer_text(question, matching_images),
+                "citations": [], "images": matching_image_paths,
+                "confidence": "medium",
+                "intent": {**intent, "requires_image": True, "requires_text": False},
+            }
+        else:
+            context = json.dumps(build_chat_context(projects, question), indent=2)
+            prompt = (
+                "You are a real estate assistant.\n"
+                "Answer ONLY using the provided data.\n"
+                "If answer not found, say \"Data not available in the uploaded documents.\"\n\n"
+                f"Data:\n{context}\n\n"
+                f"Intent:\n{json.dumps(intent)}\n\n"
+                f"Question:\n{question}\n\nAnswer:"
+            )
+            answer = generate_answer(prompt)
 
-    local_answer = answer_from_project_data(question, projects)
-    if local_answer is not None:
-        answer = local_answer
-        if intent["requires_visual_response"] and matching_images:
-            if should_prioritize_image(question) or "Data not available" in local_answer:
-                answer = image_answer_text(question, matching_images) or local_answer
-            else:
-                answer = f"{local_answer}\n\nRelated image attached."
-        return {
-            "question": question, "answer": answer,
-            "citations": [], "images": matching_image_paths,
-            "confidence": "medium",
-            "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
-        }
+            res_dict = {
+                "question": question, "answer": answer,
+                "citations": [],
+                "images": matching_image_paths if intent["requires_visual_response"] else [],
+                "confidence": "medium",
+                "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
+            }
 
-    if intent["requires_visual_response"] and matching_images:
-        return {
-            "question": question,
-            "answer": image_answer_text(question, matching_images),
-            "citations": [], "images": matching_image_paths,
-            "confidence": "medium",
-            "intent": {**intent, "requires_image": True, "requires_text": False},
-        }
-
-    context = json.dumps(build_chat_context(projects, question), indent=2)
-    prompt = (
-        "You are a real estate assistant.\n"
-        "Answer ONLY using the provided data.\n"
-        "If answer not found, say \"Data not available in the uploaded documents.\"\n\n"
-        f"Data:\n{context}\n\n"
-        f"Intent:\n{json.dumps(intent)}\n\n"
-        f"Question:\n{question}\n\nAnswer:"
-    )
-    answer = generate_answer(prompt)
-
-    return {
-        "question": question, "answer": answer,
-        "citations": [],
-        "images": matching_image_paths if intent["requires_visual_response"] else [],
-        "confidence": "medium",
-        "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
-    }
+    if routing_info and isinstance(res_dict, dict):
+        res_dict["routing"] = routing_info
+        if domain == "excavator" and "answer" in res_dict:
+            res_dict["answer"] = f"[SCANNED ROUTE: {routing_info['category'].upper()}] - {res_dict['answer']}"
+    return res_dict
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -608,13 +744,13 @@ async def delete_document(document_id: str):
 
 
 @app.get("/projects")
-async def projects():
-    return {"projects": load_projects()}
+async def projects(domain: str = "real-estate"):
+    return {"projects": load_projects(domain=domain)}
 
 
 @app.get("/builders")
-async def builders():
-    return {"builders": load_builders()}
+async def builders(domain: str = "real-estate"):
+    return {"builders": load_builders(domain=domain)}
 
 
 @app.get("/rag/metrics")

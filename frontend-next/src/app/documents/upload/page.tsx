@@ -53,6 +53,7 @@ type UploadState = {
     images_indexed: number;
     total_pages: number;
     error?: string;
+    ocr_used?: boolean;
   };
 };
 
@@ -63,8 +64,8 @@ const PIPELINE_STEPS: { status: ProcessingStatus; label: string }[] = [
   { status: "extracting_images", label: "Extracting images" },
   { status: "running_ocr", label: "Running OCR scans" },
   { status: "chunking", label: "Chunking text" },
-  { status: "embedding_text", label: "Text embeddings (bge-m3)" },
-  { status: "embedding_images", label: "Image embeddings (jina-clip-v2)" },
+  { status: "embedding_text", label: "Text embeddings (voyage-multimodal-3.5)" },
+  { status: "embedding_images", label: "Image embeddings (voyage-multimodal-3.5)" },
   { status: "indexing_qdrant", label: "Indexing into Qdrant" },
   { status: "ready", label: "Ready for chat" },
 ];
@@ -199,6 +200,7 @@ export default function UploadDocumentPage() {
           images_indexed: data.images_indexed,
           total_pages: data.total_pages,
           error: data.error,
+          ocr_used: data.ocr_used,
         },
       }));
     },
@@ -493,7 +495,7 @@ export default function UploadDocumentPage() {
                     {uploadState.result.saved_to_mongodb ? "saved" : "not saved"}
                   </span>
                   <span>·</span>
-                  <span>OCR: {uploadState.result.ocr_used ? "yes" : "no"}</span>
+                  <span>OCR: {uploadState.result?.ocr_used || uploadState.statusResult?.ocr_used ? "yes" : "no"}</span>
                 </div>
               )}
 
@@ -508,6 +510,9 @@ export default function UploadDocumentPage() {
 
           {/* Action buttons */}
           <div className="flex flex-wrap justify-end gap-3">
+            {uploadState.documentId && !isReady && (
+              <Link href={`/chat?documentId=${uploadState.documentId}`} className="hidden" />
+            )}
             {isReady && uploadState.documentId && (
               <Link
                 href={`/chat?documentId=${uploadState.documentId}`}

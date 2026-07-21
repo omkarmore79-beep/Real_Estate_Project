@@ -46,5 +46,65 @@
     "updated_at": "2026-07-12T14:10:26.076097+00:00",
     "created_at": "2026-07-12T14:08:59.929419+00:00",
     "error": ""
+  },
+  "cf3728421d254d9dae05cdd65fdaafc0": {
+    "document_id": "cf3728421d254d9dae05cdd65fdaafc0",
+    "status": "failed",
+    "progress": 0,
+    "message": "Processing failed. Please try re-uploading.",
+    "text_chunks_indexed": 0,
+    "images_indexed": 0,
+    "total_pages": 26,
+    "updated_at": "2026-07-15T06:48:42.844187+00:00",
+    "created_at": "2026-07-15T06:43:00.732298+00:00",
+    "error": "You have not yet added your payment method in the billing page and will have reduced rate limits of 3 RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://dashboard.voyageai.com/). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. Afte"
+  },
+  "108944d80d694c08a2555c29e6f25f27": {
+    "document_id": "108944d80d694c08a2555c29e6f25f27",
+    "status": "failed",
+    "progress": 0,
+    "message": "Processing failed. Please try re-uploading.",
+    "text_chunks_indexed": 0,
+    "images_indexed": 0,
+    "total_pages": 26,
+    "updated_at": "2026-07-15T06:51:22.503523+00:00",
+    "created_at": "2026-07-15T06:49:41.650890+00:00",
+    "error": "You have not yet added your payment method in the billing page and will have reduced rate limits of 3 RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://dashboard.voyageai.com/). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. Afte"
+  },
+  "5706bdeabb3a4da7915432eb9840c0b3": {
+    "document_id": "5706bdeabb3a4da7915432eb9840c0b3",
+    "status": "failed",
+    "progress": 0,
+    "message": "Processing failed. Please try re-uploading.",
+    "text_chunks_indexed": 0,
+    "images_indexed": 0,
+    "total_pages": 26,
+    "updated_at": "2026-07-15T06:53:16.855121+00:00",
+    "created_at": "2026-07-15T06:52:04.365742+00:00",
+    "error": "You have not yet added your payment method in the billing page and will have reduced rate limits of 3 RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://dashboard.voyageai.com/). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. Afte"
+  },
+  "7b457179ac164d42b78a8639fd86b8b8": {
+    "document_id": "7b457179ac164d42b78a8639fd86b8b8",
+    "status": "failed",
+    "progress": 0,
+    "message": "Processing failed. Please try re-uploading.",
+    "text_chunks_indexed": 0,
+    "images_indexed": 0,
+    "total_pages": 26,
+    "updated_at": "2026-07-15T07:05:24.806105+00:00",
+    "created_at": "2026-07-15T06:59:17.380538+00:00",
+    "error": "You have not yet added your payment method in the billing page and will have reduced rate limits of 3 RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://dashboard.voyageai.com/). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. Afte"
+  },
+  "800af8edfa9843f38d686df0f7e4dcab": {
+    "document_id": "800af8edfa9843f38d686df0f7e4dcab",
+    "status": "failed",
+    "progress": 0,
+    "message": "Processing failed. Please try re-uploading.",
+    "text_chunks_indexed": 0,
+    "images_indexed": 0,
+    "total_pages": 26,
+    "updated_at": "2026-07-16T09:04:44.973887+00:00",
+    "created_at": "2026-07-16T08:59:45.547998+00:00",
+    "error": "You have not yet added your payment method in the billing page and will have reduced rate limits of 3 RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://dashboard.voyageai.com/). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. Afte"
   }
 }

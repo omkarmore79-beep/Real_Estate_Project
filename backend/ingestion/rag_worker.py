@@ -162,6 +162,7 @@ def run_rag_indexing(
             text_chunks_indexed=text_chunks_indexed,
             images_indexed=images_indexed,
             total_pages=total_pages,
+            ocr_used=processed.get("ocr_used", False),
         )
         logger.info(
             "=== RAG WORKER DONE | doc=%s | pages=%d | text=%d | images=%d ===",

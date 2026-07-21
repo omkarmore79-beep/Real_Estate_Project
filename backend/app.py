@@ -419,6 +419,7 @@ async def document_status(document_id: str):
         "total_pages": status.get("total_pages", 0),
         "message": status.get("message", ""),
         "error": status.get("error", ""),
+        "ocr_used": status.get("ocr_used", False),
     }
 
 

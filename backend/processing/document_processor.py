@@ -141,17 +141,18 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
                 logger.warning("[%s] Failed to query local fallback for hash: %s", document_id, exc)
 
         if existing_doc:
+            existing_doc_id = existing_doc.get("document_id") or document_id
             logger.info("[%s] Duplicate document detected! Reusing data from document_id: %s", 
-                        document_id, existing_doc.get("document_id"))
+                        document_id, existing_doc_id)
             
-            # Reuse MongoDB / Local data
+            # Reuse MongoDB / Local data without creating a duplicate document record.
             reused_doc = dict(existing_doc)
-            reused_doc["document_id"] = document_id
+            reused_doc["document_id"] = existing_doc_id
             reused_doc["source_file"] = source_file
             reused_doc["stored_file"] = os.path.basename(file_path)
             
             # Overwrite metadata values if new values are provided
-            reused_metadata = reused_doc.get("metadata", {})
+            reused_metadata = reused_doc.get("metadata", {}) or {}
             if title: reused_metadata["title"] = title
             if builder: reused_metadata["builder"] = builder
             if project: reused_metadata["project"] = project
@@ -172,16 +173,16 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
 
             save_project_to_mongo(reused_doc)
             
-            # Update status to ready
+            # Update status to ready on the original document id
             set_status(
-                document_id,
+                existing_doc_id,
                 "ready",
                 text_chunks_indexed=reused_doc.get("text_chunks_indexed", 0),
                 images_indexed=reused_doc.get("images_indexed", 0),
                 total_pages=len(reused_doc.get("pages", [])),
                 message="Duplicate document detected. Reused previous embeddings and metadata successfully."
             )
-            logger.info("=== BACKGROUND PROCESSOR SUCCESS (DEDUPLICATED) | doc=%s ===", document_id)
+            logger.info("=== BACKGROUND PROCESSOR SUCCESS (DEDUPLICATED) | doc=%s ===", existing_doc_id)
             return
 
         # ── 1. Text Extraction using Multiformat Parser ─────────────────────────

@@ -13,11 +13,24 @@ heading boundaries, producing high-quality chunks without any API calls during c
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
 import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Attempt to use the enhanced chunker from repository root.
+_CHUNKER_ENHANCED_AVAILABLE = False
+try:
+    ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if ROOT_DIR not in sys.path:
+        sys.path.insert(0, ROOT_DIR)
+    from chunker_enhanced import chunk_text_pages_enhanced
+    _CHUNKER_ENHANCED_AVAILABLE = True
+except Exception:
+    chunk_text_pages_enhanced = None
 
 # Target chunk size limits (in words)
 MIN_CHUNK_WORDS = 40
@@ -132,6 +145,24 @@ def chunk_text_pages(
     Chunk page dicts into structure-aware chunks, extracting section/subsection,
     identifying figure/table references, and linking chunks in a sequential list.
     """
+    if _CHUNKER_ENHANCED_AVAILABLE and chunk_text_pages_enhanced is not None:
+        try:
+            chunks = chunk_text_pages_enhanced(pages, document_id, metadata)
+            for idx, chunk in enumerate(chunks):
+                meta = chunk.get("metadata", {})
+                if "prev_chunk_id" not in meta:
+                    meta["prev_chunk_id"] = None
+                if "next_chunk_id" not in meta:
+                    meta["next_chunk_id"] = None
+                chunk["metadata"] = meta
+            return chunks
+        except Exception as exc:
+            logger.warning(
+                "Enhanced chunker failed for document_id=%s; falling back. %s",
+                document_id,
+                exc,
+            )
+
     meta = metadata or {}
     chunks: list[dict] = []
 
@@ -226,7 +257,7 @@ def chunk_text_pages(
                     "ocr_used": ocr_used,
                     "ocr_confidence": ocr_confidence,
                     "tags": tags,
-                    "domain": meta.get("domain", "real_estate"),
+                    "domain": meta.get("domain", "generic"),
                     "figure_id": figure_id,
                     "table_id": table_id,
                     "prev_chunk_id": "",  # Linked below

@@ -78,9 +78,9 @@ logger = logging.getLogger(__name__)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Real Estate Hybrid Multimodal RAG API",
+    title="Hybrid Multimodal RAG API",
     description=(
-        "Grounded answers from uploaded real estate brochures. "
+        "Grounded answers from uploaded technical and multimodal documents. "
         "Upload returns immediately; RAG indexing runs in the background."
     ),
     version="3.1.0",
@@ -268,16 +268,17 @@ async def upload_pdf(
         logger.warning("[%s] Duplicate check exception: %s", document_id, exc)
 
     if existing_doc:
-        # Re-save metadata with new doc_id so it can be queried immediately
+        # Reuse the already indexed document and return its existing document_id.
         try:
             from storage.mongo_store import save_project_to_mongo
+            existing_doc_id = existing_doc.get("document_id")
             reused_doc = dict(existing_doc)
-            reused_doc["document_id"] = document_id
+            reused_doc["document_id"] = existing_doc_id
             reused_doc["source_file"] = safe_filename
-            reused_doc["stored_file"] = f"{document_id}_{safe_filename}"
+            reused_doc["stored_file"] = f"{existing_doc_id}_{safe_filename}"
             reused_doc["domain"] = domain
             
-            reused_meta = reused_doc.get("metadata", {})
+            reused_meta = reused_doc.get("metadata", {}) or {}
             if title: reused_meta["title"] = title
             if builder: reused_meta["builder"] = builder
             if project: reused_meta["project"] = project
@@ -295,19 +296,19 @@ async def upload_pdf(
             reused_doc["metadata"] = reused_meta
             
             save_project_to_mongo(reused_doc)
-            save_initial_status(document_id, status="ready", progress=100, filename=safe_filename)
-            set_status(document_id, "ready", 
+            save_initial_status(existing_doc_id, status="ready", progress=100, filename=safe_filename)
+            set_status(existing_doc_id, "ready", 
                        text_chunks_indexed=reused_doc.get("text_chunks_indexed", 0),
                        images_indexed=reused_doc.get("images_indexed", 0),
                        total_pages=len(reused_doc.get("pages", [])),
-                       message="Duplicate document detected. Reused previous embeddings.")
+                       message="Duplicate document detected. Reused existing indexed document.")
             
             return {
-                "document_id": document_id,
+                "document_id": existing_doc_id,
                 "status": "ready",
                 "progress": 100,
                 "filename": safe_filename,
-                "message": "Duplicate document detected. Embeddings successfully reused.",
+                "message": "Duplicate document detected. Reused existing indexed document.",
                 "saved_to_mongodb": mongo_ok,
                 "ocr_used": False,
             }

@@ -273,14 +273,23 @@ def retrieve(
         if confidence >= 0.35:
             confident_text.append(r)
 
+    if not confident_text and text_only:
+        logger.warning(
+            "No text chunks passed the confidence threshold; falling back to top %d text results.",
+            top_k,
+        )
+        confident_text = text_only[:top_k]
+
     # ── 7. Parent-Child Context Window Expansion ────────────────────────────
     # For top-3 text results, fetch their prev/next chunk neighbours from Qdrant
     # and append them as context-only entries (score=0, source_type=context_window)
+    # For image results, fetch parent chunk and nearby context automatically
     try:
         from retrieval.qdrant_service import get_chunks_by_ids
         context_window_chunks: list[dict] = []
         seen_ids: set[str] = {r["id"] for r in confident_text}
 
+        # A. Text chunk context expansion (prev/next neighbours)
         for r in confident_text[:3]:
             meta = r.get("metadata", {})
             neighbour_ids = []
@@ -315,6 +324,87 @@ def retrieve(
                         })
 
         confident_text = confident_text + context_window_chunks
+
+        # B. Image parent-child context expansion
+        # For each retrieved image, fetch its parent chunk and nearby context
+        image_context_chunks: list[dict] = []
+        for img_result in image_only[:3]:
+            img_meta = img_result.get("metadata", {})
+            parent_chunk_id = img_meta.get("parent_chunk_id")
+            
+            if parent_chunk_id and parent_chunk_id not in seen_ids:
+                try:
+                    # Fetch the parent chunk (page/section containing the image)
+                    parent_chunks = get_chunks_by_ids([parent_chunk_id], collection_name=target_text_col)
+                    for parent in parent_chunks:
+                        if parent["id"] not in seen_ids:
+                            seen_ids.add(parent["id"])
+                            parent_payload = parent.get("payload", {})
+                            
+                            # Add parent chunk as context
+                            image_context_chunks.append({
+                                "id": parent["id"],
+                                "score": 0.0,
+                                "source_type": "image_parent_context",
+                                "content": parent.get("content", ""),
+                                "document_id": parent_payload.get("document_id", img_result.get("document_id", "")),
+                                "source_file": parent_payload.get("source_file", ""),
+                                "page_number": parent_payload.get("page_number"),
+                                "image_path": img_result.get("image_path"),
+                                "image_url": img_result.get("image_url"),
+                                "image_id": img_result.get("image_id"),
+                                "image_type": img_result.get("image_type"),
+                                "caption": img_result.get("caption"),
+                                "ocr_used": parent_payload.get("ocr_used", False),
+                                "citation_id": f"img_parent_{parent['id'][:8]}",
+                                "metadata": parent_payload,
+                                "confidence_score": 0.0,
+                                "linked_image_id": img_result.get("image_id"),
+                            })
+                            
+                            # Also fetch parent's neighbours for additional context
+                            parent_meta = parent_payload
+                            neighbour_ids = []
+                            if parent_meta.get("prev_chunk_id"):
+                                neighbour_ids.append(parent_meta["prev_chunk_id"])
+                            if parent_meta.get("next_chunk_id"):
+                                neighbour_ids.append(parent_meta["next_chunk_id"])
+                            
+                            if neighbour_ids:
+                                neighbours = get_chunks_by_ids(neighbour_ids, collection_name=target_text_col)
+                                for n in neighbours:
+                                    if n["id"] not in seen_ids:
+                                        seen_ids.add(n["id"])
+                                        n_payload = n.get("payload", {})
+                                        image_context_chunks.append({
+                                            "id": n["id"],
+                                            "score": 0.0,
+                                            "source_type": "image_nearby_context",
+                                            "content": n.get("content", ""),
+                                            "document_id": n_payload.get("document_id", img_result.get("document_id", "")),
+                                            "source_file": n_payload.get("source_file", ""),
+                                            "page_number": n_payload.get("page_number"),
+                                            "image_path": img_result.get("image_path"),
+                                            "image_url": img_result.get("image_url"),
+                                            "image_id": img_result.get("image_id"),
+                                            "image_type": img_result.get("image_type"),
+                                            "caption": img_result.get("caption"),
+                                            "ocr_used": n_payload.get("ocr_used", False),
+                                            "citation_id": f"img_nearby_{n['id'][:8]}",
+                                            "metadata": n_payload,
+                                            "confidence_score": 0.0,
+                                            "linked_image_id": img_result.get("image_id"),
+                                        })
+                except Exception as parent_exc:
+                    logger.warning("Failed to fetch parent context for image %s: %s", 
+                                 img_result.get("image_id"), parent_exc)
+
+        # Add image context chunks to the results
+        confident_text = confident_text + image_context_chunks
+        
+        logger.info("Parent-child expansion: added %d text context chunks, %d image parent context chunks", 
+                    len(context_window_chunks), len(image_context_chunks))
+                    
     except Exception as exc:
         logger.warning("Context window expansion failed: %s", exc)
 

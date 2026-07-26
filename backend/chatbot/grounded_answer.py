@@ -193,14 +193,18 @@ def _assess_confidence(text_results: list[dict]) -> str:
         return "low"
     
     top_score = text_results[0].get("confidence_score", text_results[0].get("score", 0.0))
-    
+    has_reranker = any(r.get("rerank_score") is not None for r in text_results)
+
     # If using cross-encoder reranker, score is already sigmoid-mapped.
-    # High confidence: top chunk score >= 0.70
-    # Medium confidence: top chunk score >= 0.40
-    # Low confidence: top chunk score < 0.40
-    if top_score >= 0.65:
-        return "high"
-    elif top_score >= 0.40:
+    if has_reranker:
+        if top_score >= 0.65:
+            return "high"
+        elif top_score >= 0.40:
+            return "medium"
+        return "low"
+
+    # If no reranker was applied, preserve retrieval evidence as medium confidence
+    if top_score > 0:
         return "medium"
     return "low"
 

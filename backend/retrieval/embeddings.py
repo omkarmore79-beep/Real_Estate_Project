@@ -17,6 +17,7 @@ import hashlib
 import time
 from PIL import Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from logging_and_resilience import LogContext
 
 from config import VOYAGE_API_KEY, TEXT_VECTOR_DIM, IMAGE_VECTOR_DIM, TEXT_EMBEDDING_MODEL, VOYAGE_TPM_LIMIT
 
@@ -60,14 +61,16 @@ def _embed_texts_with_retry(client, texts: list[str], model: str, input_type: st
     from storage.doc_status import set_status
     max_attempts = 5
     base_sleep = 2.0
-    
-    for attempt in range(1, max_attempts + 1):
-        try:
-            res = client.embed(texts=texts, model=model, input_type=input_type)
-            return res.embeddings
-        except Exception as exc:
-            is_rate = _is_rate_limit_error(exc)
-            retry_after = get_retry_after(exc)
+
+    with LogContext(document_id=document_id, stage="voyage.embed_text") as ctx:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                res = client.embed(texts=texts, model=model, input_type=input_type)
+                ctx.info("Text embed request succeeded", batch_size=len(texts), model=model)
+                return res.embeddings
+            except Exception as exc:
+                is_rate = _is_rate_limit_error(exc)
+                retry_after = get_retry_after(exc)
             
             if attempt == max_attempts:
                 logger.error("All text embedding retry attempts failed: %s", exc)
@@ -93,14 +96,16 @@ def _embed_multimodal_with_retry(client, inputs: list, model: str, input_type: s
     from storage.doc_status import set_status
     max_attempts = 5
     base_sleep = 2.0
-    
-    for attempt in range(1, max_attempts + 1):
-        try:
-            res = client.multimodal_embed(inputs=inputs, model=model, input_type=input_type)
-            return res.embeddings
-        except Exception as exc:
-            is_rate = _is_rate_limit_error(exc)
-            retry_after = get_retry_after(exc)
+
+    with LogContext(document_id=document_id, stage="voyage.embed_multimodal") as ctx:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                res = client.multimodal_embed(inputs=inputs, model=model, input_type=input_type)
+                ctx.info("Multimodal embed request succeeded", batch_size=len(inputs), model=model)
+                return res.embeddings
+            except Exception as exc:
+                is_rate = _is_rate_limit_error(exc)
+                retry_after = get_retry_after(exc)
             
             if attempt == max_attempts:
                 logger.error("All multimodal embedding retry attempts failed: %s", exc)
@@ -270,8 +275,10 @@ class ImageEmbedder:
         try:
             img = Image.open(image_path).convert("RGB")
             client = get_voyage_client()
-            vecs = _embed_multimodal_with_retry(client, [[img]], self.model_name, input_type)
-            vec = vecs[0]
+            with LogContext(image_id=cache_key or image_path, stage="voyage.embed_image_file") as ctx:
+                vecs = _embed_multimodal_with_retry(client, [[img]], self.model_name, input_type, document_id)
+                vec = vecs[0]
+                ctx.info("Image file embed completed", image_path=image_path)
             if cache_key:
                 set_json_cache(cache_key, vec, expire_seconds=86400 * 30)
             return vec
@@ -303,8 +310,10 @@ class ImageEmbedder:
         try:
             img = Image.open(image_path).convert("RGB")
             client = get_voyage_client()
-            vecs = _embed_multimodal_with_retry(client, [[text, img]], self.model_name, input_type)
-            vec = vecs[0]
+            with LogContext(image_id=cache_key or image_path, stage="voyage.embed_interleaved") as ctx:
+                vecs = _embed_multimodal_with_retry(client, [[text, img]], self.model_name, input_type, document_id)
+                vec = vecs[0]
+                ctx.info("Interleaved embed completed", image_path=image_path)
             if cache_key:
                 set_json_cache(cache_key, vec, expire_seconds=86400 * 30)
             return vec

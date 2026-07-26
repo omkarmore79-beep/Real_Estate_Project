@@ -16,8 +16,26 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 import uuid
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Attempt to use the enhanced image analyzer from repository root.
+_IMAGE_ANALYZER_ENHANCED_AVAILABLE = False
+try:
+    ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if ROOT_DIR not in sys.path:
+        sys.path.insert(0, ROOT_DIR)
+    from image_analyzer_enhanced import (
+        build_image_embedding_text_enhanced,
+        process_images_enhanced,
+    )
+    _IMAGE_ANALYZER_ENHANCED_AVAILABLE = True
+except Exception:
+    build_image_embedding_text_enhanced = None
+    process_images_enhanced = None
 
 from PIL import Image
 
@@ -149,6 +167,16 @@ def process_images(
     Build image metadata records from processed PDF pages, extracting proximal captions,
     figure numbers, and OCR labels.
     """
+    if _IMAGE_ANALYZER_ENHANCED_AVAILABLE and process_images_enhanced is not None:
+        try:
+            return process_images_enhanced(pages, document_id, source_file, metadata)
+        except Exception as exc:
+            logger.warning(
+                "Enhanced image processor failed for document_id=%s; falling back. %s",
+                document_id,
+                exc,
+            )
+
     meta = metadata or {}
     records: list[dict] = []
 
@@ -215,7 +243,7 @@ def process_images(
                     "project": meta.get("project_name", meta.get("project", "")),
                     "builder": meta.get("builder", ""),
                     "document_type": meta.get("document_type", ""),
-                    "domain": meta.get("domain", "real_estate"),
+                    "domain": meta.get("domain", "generic"),
                     "section": section,
                     "nearby_text": nearby_text[:500],
                     "ocr_context": ocr_text[:500],
@@ -321,6 +349,16 @@ def build_image_embedding_text(record: dict) -> str:
     Build a combined structured multimodal text string for image embedding.
     Combines Document, Section, Caption, Nearby Paragraph context, OCR tags, and Image Summary.
     """
+    if _IMAGE_ANALYZER_ENHANCED_AVAILABLE and build_image_embedding_text_enhanced is not None:
+        try:
+            return build_image_embedding_text_enhanced(record)
+        except Exception as exc:
+            logger.warning(
+                "Enhanced image embedding text builder failed for image_id=%s; falling back. %s",
+                record.get("image_id"),
+                exc,
+            )
+
     meta = record.get("metadata", {})
     parts = []
     

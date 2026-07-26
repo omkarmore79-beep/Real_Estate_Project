@@ -25,7 +25,8 @@ _env_source = str(BASE_DIR / ".env")
 # ── Groq / LLM ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "").strip()
+ENABLE_GROQ_VISION = os.getenv("ENABLE_GROQ_VISION", "false").lower() == "true"
 
 # ── MongoDB ────────────────────────────────────────────────────────────────────
 MONGODB_URI = os.getenv("MONGODB_URI")
@@ -100,7 +101,8 @@ IMAGE_FOLDER = os.path.join(BASE_DIR, "storage", "images")
 logger.info("Configuration loaded from %s", _env_source)
 logger.info("MongoDB configured=%s db=%s collection=%s", bool(MONGODB_URI), MONGODB_DB, MONGODB_COLLECTION)
 logger.info("Qdrant configured=%s host=%s", bool(QDRANT_URL), _qdrant_host)
-logger.info("OCR enabled=%s; upload_without_mongodb=%s", OCR_ENABLED, ALLOW_UPLOAD_WITHOUT_MONGODB)
+logger.info("OCR enabled=%s; upload_without_mongodb=%s; groq_vision_enabled=%s", OCR_ENABLED, ALLOW_UPLOAD_WITHOUT_MONGODB, ENABLE_GROQ_VISION)
+logger.info("Groq Vision model configured=%s", bool(GROQ_VISION_MODEL))
 logger.info("Models: llm=%s text=%s image=%s reranker=%s", LLM_MODEL, TEXT_EMBEDDING_MODEL, IMAGE_EMBEDDING_MODEL, VOYAGE_RERANK_MODEL)
 
 

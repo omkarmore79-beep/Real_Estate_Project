@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-
+from logging_and_resilience import LogContext, RetryConfig, retry
 from config import DATA_FOLDER, MONGODB_COLLECTION, MONGODB_DB, MONGODB_URI
 
 try:
@@ -31,10 +31,11 @@ def _get_db():
 
 
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=150, max_delay_ms=1500))
 def _get_collection():
     db = _get_db()
     if db is None:
-        return None
+        raise RuntimeError("MongoDB is unavailable")
 
     return db[MONGODB_COLLECTION]
 
@@ -227,23 +228,25 @@ def _delete_project_locally(document_id):
 
 def save_project_to_mongo(project):
     from config import ALLOW_UPLOAD_WITHOUT_MONGODB
-    try:
-        collection = _get_collection()
-        if collection is not None:
-            now = datetime.now(timezone.utc).isoformat()
-            document = dict(project)
-            document["updated_at"] = now
-            document.setdefault("uploaded_at", now)
+    with LogContext(document_id=project.get("document_id"), stage="mongo.save_project") as ctx:
+        try:
+            collection = _get_collection()
+            if collection is not None:
+                now = datetime.now(timezone.utc).isoformat()
+                document = dict(project)
+                document["updated_at"] = now
+                document.setdefault("uploaded_at", now)
 
-            collection.update_one(
-                {"document_id": document["document_id"]},
-                {"$set": document},
-                upsert=True,
-            )
-            saved = collection.find_one({"document_id": document["document_id"]})
-            return _serialize_document(saved)
-    except Exception as exc:
-        print(f"MongoDB save failed: {exc}")
+                collection.update_one(
+                    {"document_id": document["document_id"]},
+                    {"$set": document},
+                    upsert=True,
+                )
+                saved = collection.find_one({"document_id": document["document_id"]})
+                return _serialize_document(saved)
+        except Exception as exc:
+            ctx.error("MongoDB save failed", error=exc)
+            print(f"MongoDB save failed: {exc}")
 
     if ALLOW_UPLOAD_WITHOUT_MONGODB:
         return _save_project_locally(project)
@@ -284,38 +287,40 @@ def save_file_to_mongo(
     image_id=None,
 ):
     from config import ALLOW_UPLOAD_WITHOUT_MONGODB
-    try:
-        fs = _get_gridfs()
-        if fs is not None:
-            metadata = {
-                "document_id": document_id,
-                "file_kind": file_kind,
-                "content_type": content_type,
-                "filename": filename,
-            }
-            if image_id:
-                metadata["image_id"] = image_id
+    with LogContext(document_id=document_id, stage="mongo.save_file") as ctx:
+        try:
+            fs = _get_gridfs()
+            if fs is not None:
+                metadata = {
+                    "document_id": document_id,
+                    "file_kind": file_kind,
+                    "content_type": content_type,
+                    "filename": filename,
+                }
+                if image_id:
+                    metadata["image_id"] = image_id
 
-            existing_query = {
-                "metadata.document_id": document_id,
-                "metadata.file_kind": file_kind,
-                "metadata.filename": filename,
-            }
-            if image_id:
-                existing_query["metadata.image_id"] = image_id
+                existing_query = {
+                    "metadata.document_id": document_id,
+                    "metadata.file_kind": file_kind,
+                    "metadata.filename": filename,
+                }
+                if image_id:
+                    existing_query["metadata.image_id"] = image_id
 
-            for existing in fs.find(existing_query):
-                fs.delete(existing._id)
+                for existing in fs.find(existing_query):
+                    fs.delete(existing._id)
 
-            with open(file_path, "rb") as file_obj:
-                return fs.put(
-                    file_obj,
-                    filename=filename,
-                    content_type=content_type,
-                    metadata=metadata,
-                )
-    except Exception as exc:
-        print(f"MongoDB file save failed: {exc}")
+                with open(file_path, "rb") as file_obj:
+                    return fs.put(
+                        file_obj,
+                        filename=filename,
+                        content_type=content_type,
+                        metadata=metadata,
+                    )
+        except Exception as exc:
+            ctx.error("MongoDB file save failed", error=exc)
+            print(f"MongoDB file save failed: {exc}")
 
     if ALLOW_UPLOAD_WITHOUT_MONGODB:
         return _save_file_locally(

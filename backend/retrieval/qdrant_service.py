@@ -24,6 +24,7 @@ from config import (
     QDRANT_URL,
     TEXT_VECTOR_DIM,
 )
+from logging_and_resilience import LogContext, RetryConfig, retry
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ def get_async_qdrant_client():
 
 # ── Collection management ──────────────────────────────────────────────────────
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=100, max_delay_ms=1000))
 def create_collections() -> dict[str, str]:
     """
     Create text and image Qdrant collections if they do not already exist,
@@ -51,9 +53,10 @@ def create_collections() -> dict[str, str]:
     """
     from qdrant_client.models import Distance, VectorParams
 
-    client = get_qdrant_client()
-    existing = {c.name for c in client.get_collections().collections}
-    results: dict[str, str] = {}
+    with LogContext(stage="qdrant.create_collections"):
+        client = get_qdrant_client()
+        existing = {c.name for c in client.get_collections().collections}
+        results: dict[str, str] = {}
 
     def verify_and_create(col_name: str, target_dim: int) -> str:
         recreate = False
@@ -112,6 +115,7 @@ def create_collections() -> dict[str, str]:
 
 # ── Indexing threshold control ─────────────────────────────────────────────────
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=100, max_delay_ms=1000))
 def set_indexing_threshold(
     threshold: int,
     collection_names: list[str] | None = None,
@@ -126,21 +130,22 @@ def set_indexing_threshold(
     """
     from qdrant_client.models import OptimizersConfigDiff
 
-    client = get_qdrant_client()
-    targets = collection_names or [QDRANT_COLLECTION_TEXT, QDRANT_COLLECTION_IMAGES]
+    with LogContext(stage="qdrant.set_indexing_threshold"):
+        client = get_qdrant_client()
+        targets = collection_names or [QDRANT_COLLECTION_TEXT, QDRANT_COLLECTION_IMAGES]
 
-    for col in targets:
-        try:
-            client.update_collection(
-                collection_name=col,
-                optimizer_config=OptimizersConfigDiff(indexing_threshold=threshold),
-            )
-            if threshold == 0:
-                logger.info("HNSW indexing DISABLED on collection '%s' for bulk write.", col)
-            else:
-                logger.info("HNSW indexing RESTORED (threshold=%d) on collection '%s'.", threshold, col)
-        except Exception as exc:
-            logger.warning("Could not set indexing_threshold=%d on %s: %s", threshold, col, exc)
+        for col in targets:
+            try:
+                client.update_collection(
+                    collection_name=col,
+                    optimizer_config=OptimizersConfigDiff(indexing_threshold=threshold),
+                )
+                if threshold == 0:
+                    logger.info("HNSW indexing DISABLED on collection '%s' for bulk write.", col)
+                else:
+                    logger.info("HNSW indexing RESTORED (threshold=%d) on collection '%s'.", threshold, col)
+            except Exception as exc:
+                logger.warning("Could not set indexing_threshold=%d on %s: %s", threshold, col, exc)
 
 
 async def set_indexing_threshold_async(
@@ -150,57 +155,60 @@ async def set_indexing_threshold_async(
     """Async counterpart used by the background ingestion pipeline."""
     from qdrant_client.models import OptimizersConfigDiff
 
-    client = get_async_qdrant_client()
-    targets = collection_names or [QDRANT_COLLECTION_TEXT, QDRANT_COLLECTION_IMAGES]
-    for col in targets:
-        try:
-            await client.update_collection(
-                collection_name=col,
-                optimizer_config=OptimizersConfigDiff(indexing_threshold=threshold),
-            )
-            logger.info("Async indexing threshold=%d applied to %s", threshold, col)
-        except Exception as exc:
-            logger.warning("Could not set async indexing_threshold=%d on %s: %s", threshold, col, exc)
+    with LogContext(stage="qdrant.set_indexing_threshold_async"):
+        client = get_async_qdrant_client()
+        targets = collection_names or [QDRANT_COLLECTION_TEXT, QDRANT_COLLECTION_IMAGES]
+        for col in targets:
+            try:
+                await client.update_collection(
+                    collection_name=col,
+                    optimizer_config=OptimizersConfigDiff(indexing_threshold=threshold),
+                )
+                logger.info("Async indexing threshold=%d applied to %s", threshold, col)
+            except Exception as exc:
+                logger.warning("Could not set async indexing_threshold=%d on %s: %s", threshold, col, exc)
 
 
 async def create_collections_async() -> dict[str, str]:
     """Create target collections through AsyncQdrantClient for bulk ingestion."""
     from qdrant_client.models import Distance, OptimizersConfigDiff, PayloadSchemaType, VectorParams
 
-    client = get_async_qdrant_client()
-    results: dict[str, str] = {}
-    for name, dimension in ((QDRANT_COLLECTION_TEXT, TEXT_VECTOR_DIM), (QDRANT_COLLECTION_IMAGES, IMAGE_VECTOR_DIM)):
-        status = "exists"
-        try:
-            info = await client.get_collection(collection_name=name)
-            vectors = info.config.params.vectors
-            current = getattr(vectors, "size", None)
-            if isinstance(vectors, dict):
-                current = vectors.get("size")
-            if current != dimension:
-                await client.delete_collection(collection_name=name)
-                raise RuntimeError("dimension mismatch")
-        except Exception:
-            await client.create_collection(
-                collection_name=name,
-                vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
-                optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
-            )
-            status = "created"
-        try:
-            await client.create_payload_index(
-                collection_name=name,
-                field_name="document_id",
-                field_schema=PayloadSchemaType.KEYWORD,
-            )
-        except Exception:
-            pass
-        results[name] = status
+    with LogContext(stage="qdrant.create_collections_async"):
+        client = get_async_qdrant_client()
+        results: dict[str, str] = {}
+        for name, dimension in ((QDRANT_COLLECTION_TEXT, TEXT_VECTOR_DIM), (QDRANT_COLLECTION_IMAGES, IMAGE_VECTOR_DIM)):
+            status = "exists"
+            try:
+                info = await client.get_collection(collection_name=name)
+                vectors = info.config.params.vectors
+                current = getattr(vectors, "size", None)
+                if isinstance(vectors, dict):
+                    current = vectors.get("size")
+                if current != dimension:
+                    await client.delete_collection(collection_name=name)
+                    raise RuntimeError("dimension mismatch")
+            except Exception:
+                await client.create_collection(
+                    collection_name=name,
+                    vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+                    optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
+                )
+                status = "created"
+            try:
+                await client.create_payload_index(
+                    collection_name=name,
+                    field_name="document_id",
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception:
+                pass
+            results[name] = status
     return results
 
 
 # ── Batched text upsert ────────────────────────────────────────────────────────
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=100, max_delay_ms=1000))
 def upsert_text_chunks_batched(
     chunks: list[dict],
     collection_name: str | None = None,
@@ -213,13 +221,14 @@ def upsert_text_chunks_batched(
     """
     from qdrant_client.models import PointStruct
 
-    if not chunks:
-        return 0
+    with LogContext(stage="qdrant.upsert_text_chunks"):
+        if not chunks:
+            return 0
 
-    target = collection_name or QDRANT_COLLECTION_TEXT
-    client = get_qdrant_client()
-    total = 0
-    num_batches = (len(chunks) + batch_size - 1) // batch_size
+        target = collection_name or QDRANT_COLLECTION_TEXT
+        client = get_qdrant_client()
+        total = 0
+        num_batches = (len(chunks) + batch_size - 1) // batch_size
 
     for batch_idx in range(num_batches):
         batch = chunks[batch_idx * batch_size : (batch_idx + 1) * batch_size]
@@ -255,6 +264,7 @@ def upsert_text_chunks_batched(
 
 # ── Batched image upsert ───────────────────────────────────────────────────────
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=100, max_delay_ms=1000))
 def upsert_image_chunks_batched(
     chunks: list[dict],
     collection_name: str | None = None,
@@ -266,13 +276,14 @@ def upsert_image_chunks_batched(
     """
     from qdrant_client.models import PointStruct
 
-    if not chunks:
-        return 0
+    with LogContext(stage="qdrant.upsert_image_chunks"):
+        if not chunks:
+            return 0
 
-    target = collection_name or QDRANT_COLLECTION_IMAGES
-    client = get_qdrant_client()
-    total = 0
-    num_batches = (len(chunks) + batch_size - 1) // batch_size
+        target = collection_name or QDRANT_COLLECTION_IMAGES
+        client = get_qdrant_client()
+        total = 0
+        num_batches = (len(chunks) + batch_size - 1) // batch_size
 
     for batch_idx in range(num_batches):
         batch = chunks[batch_idx * batch_size : (batch_idx + 1) * batch_size]
@@ -314,13 +325,14 @@ async def upsert_text_chunks_batched_async(
     """Async batched text upsert using AsyncQdrantClient."""
     from qdrant_client.models import PointStruct
 
-    if not chunks:
-        return 0
+    with LogContext(stage="qdrant.upsert_text_chunks_async"):
+        if not chunks:
+            return 0
 
-    target = collection_name or QDRANT_COLLECTION_TEXT
-    async_client = get_async_qdrant_client()
-    total = 0
-    num_batches = (len(chunks) + batch_size - 1) // batch_size
+        target = collection_name or QDRANT_COLLECTION_TEXT
+        async_client = get_async_qdrant_client()
+        total = 0
+        num_batches = (len(chunks) + batch_size - 1) // batch_size
 
     for batch_idx in range(num_batches):
         batch = chunks[batch_idx * batch_size : (batch_idx + 1) * batch_size]
@@ -361,13 +373,14 @@ async def upsert_image_chunks_batched_async(
     """Async batched image upsert using AsyncQdrantClient."""
     from qdrant_client.models import PointStruct
 
-    if not chunks:
-        return 0
+    with LogContext(stage="qdrant.upsert_image_chunks_async"):
+        if not chunks:
+            return 0
 
-    target = collection_name or QDRANT_COLLECTION_IMAGES
-    async_client = get_async_qdrant_client()
-    total = 0
-    num_batches = (len(chunks) + batch_size - 1) // batch_size
+        target = collection_name or QDRANT_COLLECTION_IMAGES
+        async_client = get_async_qdrant_client()
+        total = 0
+        num_batches = (len(chunks) + batch_size - 1) // batch_size
 
     for batch_idx in range(num_batches):
         batch = chunks[batch_idx * batch_size : (batch_idx + 1) * batch_size]
@@ -414,6 +427,7 @@ def upsert_image_chunks(chunks: list[dict], collection_name: str | None = None) 
 
 # ── Search ─────────────────────────────────────────────────────────────────────
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=100, max_delay_ms=500))
 def search_text_dense(
     query_vector: list[float],
     filters: dict | None = None,
@@ -425,23 +439,24 @@ def search_text_dense(
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
-    try:
-        res = client.query_points(
-            collection_name=target,
-            query=query_vector,
-            query_filter=qdrant_filter,
-            limit=top_k,
-            with_payload=True,
-        )
-        results = res.points
-    except (AttributeError, TypeError):
-        results = client.search(
-            collection_name=target,
-            query_vector=query_vector,
-            query_filter=qdrant_filter,
-            limit=top_k,
-            with_payload=True,
-        )
+    with LogContext(stage="qdrant.search_text_dense"):
+        try:
+            res = client.query_points(
+                collection_name=target,
+                query=query_vector,
+                query_filter=qdrant_filter,
+                limit=top_k,
+                with_payload=True,
+            )
+            results = res.points
+        except (AttributeError, TypeError):
+            results = client.search(
+                collection_name=target,
+                query_vector=query_vector,
+                query_filter=qdrant_filter,
+                limit=top_k,
+                with_payload=True,
+            )
     return _format_results(results)
 
 
@@ -496,6 +511,7 @@ def search_text_keyword(
     return results
 
 
+@retry(RetryConfig(max_attempts=3, initial_delay_ms=100, max_delay_ms=500))
 def search_images(
     query_vector: list[float],
     filters: dict | None = None,
@@ -507,23 +523,24 @@ def search_images(
     client = get_qdrant_client()
     qdrant_filter = _build_filter(filters)
 
-    try:
-        res = client.query_points(
-            collection_name=target,
-            query=query_vector,
-            query_filter=qdrant_filter,
-            limit=top_k,
-            with_payload=True,
-        )
-        results = res.points
-    except (AttributeError, TypeError):
-        results = client.search(
-            collection_name=target,
-            query_vector=query_vector,
-            query_filter=qdrant_filter,
-            limit=top_k,
-            with_payload=True,
-        )
+    with LogContext(stage="qdrant.search_images"):
+        try:
+            res = client.query_points(
+                collection_name=target,
+                query=query_vector,
+                query_filter=qdrant_filter,
+                limit=top_k,
+                with_payload=True,
+            )
+            results = res.points
+        except (AttributeError, TypeError):
+            results = client.search(
+                collection_name=target,
+                query_vector=query_vector,
+                query_filter=qdrant_filter,
+                limit=top_k,
+                with_payload=True,
+            )
     return _format_results(results)
 
 

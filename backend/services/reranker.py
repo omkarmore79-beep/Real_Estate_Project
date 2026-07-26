@@ -147,6 +147,9 @@ async def rerank_async(query: str, chunks: List[dict], top_k: int = 10) -> List[
         
     if not VOYAGE_API_KEY:
         logger.warning("VOYAGE_API_KEY is not set. Reranker returning chunks as-is.")
+        for idx, c in enumerate(chunks):
+            chunks[idx] = dict(c)
+            chunks[idx]["rerank_score"] = float(c.get("score", 0.0))
         return chunks
 
     docs = [get_chunk_text_representation(c) for c in chunks]

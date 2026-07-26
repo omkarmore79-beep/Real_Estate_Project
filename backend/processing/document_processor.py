@@ -185,9 +185,10 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
             return
 
         # ── 1. Text Extraction using Multiformat Parser ─────────────────────────
-        set_status(document_id, "extracting_text")
+        set_status(document_id, "layout_parsing", message="Parsing document layout and hierarchy...")
         rag_images_dir = os.path.join(os.path.dirname(file_path), "rag_images")
         
+        start_parse = datetime.now(timezone.utc)
         processed = parse_document(
             file_path=file_path,
             document_id=document_id,
@@ -195,12 +196,45 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
             output_folder=rag_images_dir,
             image_base_path=f"documents/{document_id}/images",
         )
+        end_parse = datetime.now(timezone.utc)
+        logger.info("[%s] Ingestion step: PARSING | Elapsed: %.2fs", document_id, (end_parse - start_parse).total_seconds())
+
         pages = processed.get("pages", [])
         total_pages = processed.get("total_pages", len(pages))
         cleaned_text = clean_text(processed.get("full_text", ""))
         logger.info("[%s] Text extracted: %d chars, %d pages", document_id, len(cleaned_text), total_pages)
 
+        # ── Incremental Versioning ───────────────────────────────────────────
+        from storage.mongo_store import _get_collection, _load_projects_locally
+        prev_doc = None
+        try:
+            col = _get_collection()
+            if col is not None:
+                prev_doc = col.find_one({"source_file": source_file}, sort=[("metadata.version", -1)])
+            if not prev_doc:
+                local_projects = _load_projects_locally(include_raw_text=True)
+                for p in local_projects:
+                    if p.get("source_file") == source_file:
+                        if not prev_doc or float(p.get("metadata", {}).get("version", "1.0")) > float(prev_doc.get("metadata", {}).get("version", "1.0")):
+                            prev_doc = p
+        except Exception as exc:
+            logger.warning("[%s] Failed to query previous version for versioning: %s", document_id, exc)
+
+        doc_version = "1.0"
+        if prev_doc:
+            prev_hash = prev_doc.get("hash")
+            if prev_hash != file_hash:
+                try:
+                    prev_ver_str = prev_doc.get("metadata", {}).get("version", "1.0")
+                    doc_version = f"{float(prev_ver_str) + 0.1:.1f}"
+                    logger.info("[%s] New version of %s detected. Incrementing version to %s", document_id, source_file, doc_version)
+                except Exception:
+                    doc_version = "1.1"
+            else:
+                doc_version = prev_doc.get("metadata", {}).get("version", "1.0")
+
         # ── 2. LLM metadata formatter ────────────────────────────────────────
+        set_status(document_id, "extracting_text", message="Extracting structural text blocks...")
         try:
             formatted_output = format_with_llm(cleaned_text)
             cleaned_output = _clean_llm_output(formatted_output)
@@ -235,12 +269,12 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
             saved_file_id = None
 
         # ── 5. Save page images to MongoDB GridFS if PDF or Scanned ───────────
-        set_status(document_id, "extracting_images")
+        set_status(document_id, "extracting_images", message="Saving extracted page images...")
         image_metadata = []
         for page in pages:
             for image in page.get("images", []):
                 image_id = image.get("image_id")
-                local_path = image.pop("local_path", None)
+                local_path = image.get("local_path")
                 if not image_id or not local_path:
                     continue
                 try:
@@ -261,6 +295,7 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
         json_data.update({
             "images": image_metadata,
             "pages": pages,
+            "parents": processed.get("parents", {}),  # Store parents mapping!
             "document_id": document_id,
             "source_file": source_file,
             "stored_file": os.path.basename(file_path),
@@ -283,11 +318,12 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
                 "component_tags": [t.strip() for t in (component_tags or "").split(",") if t.strip()],
                 "dtc_codes": [t.strip() for t in (dtc_codes or "").split(",") if t.strip()],
                 "supersedes_doc_id": supersedes_doc_id or "",
+                "version": doc_version,
             },
         })
 
         # ── Stage 2: Chunk text ──────────────────────────────────────────
-        set_status(document_id, "chunking", total_pages=total_pages)
+        set_status(document_id, "generating_chunks", total_pages=total_pages, message="Generating structure-aware chunks...")
         
         # Calculate dynamic confidence weight for excavator
         if domain == "excavator":
@@ -314,6 +350,7 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
                 "dtc_codes": [t.strip() for t in (dtc_codes or "").split(",") if t.strip()],
                 "supersedes_doc_id": supersedes_doc_id,
                 "confidence_weight": confidence_weight,
+                "version": doc_version,
             }
         else:
             doc_metadata = {
@@ -323,47 +360,51 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
                 "document_type": document_type,
                 "source_file": source_file,
                 "hash": file_hash,
+                "version": doc_version,
             }
             
+        start_chunk = datetime.now(timezone.utc)
         text_chunks = chunk_text_pages(pages, document_id, doc_metadata)
+        end_chunk = datetime.now(timezone.utc)
+        logger.info("[%s] Ingestion step: CHUNKING | Elapsed: %.2fs", document_id, (end_chunk - start_chunk).total_seconds())
         logger.info("[%s] Text chunks created: %d", document_id, len(text_chunks))
 
         # ── Stage 3: Embed text ──────────────────────────────────────────
-        set_status(document_id, "embedding_text", total_pages=total_pages)
+        set_status(document_id, "generating_embeddings", total_pages=total_pages, message="Generating Voyage embeddings...")
+        
+        start_embed_text = datetime.now(timezone.utc)
         if text_chunks:
             logger.info("[%s] Generating text embeddings...", document_id)
             text_embedder = get_text_embedder()
             chunk_texts = [c["content"] for c in text_chunks]
-            text_vectors = text_embedder.embed_batch(chunk_texts)
+            text_vectors = text_embedder.embed_batch(chunk_texts, document_id=document_id)
             for chunk, vec in zip(text_chunks, text_vectors):
                 chunk["vector"] = vec
         else:
             logger.warning("[%s] No text chunks to embed", document_id)
+        end_embed_text = datetime.now(timezone.utc)
+        logger.info("[%s] Ingestion step: TEXT_EMBEDDING | Elapsed: %.2fs", document_id, (end_embed_text - start_embed_text).total_seconds())
 
         # ── Stage 4: Embed images ────────────────────────────────────────
-        set_status(document_id, "embedding_images", total_pages=total_pages)
         image_records = process_images(pages, document_id, source_file, doc_metadata)
         logger.info("[%s] Image records created: %d", document_id, len(image_records))
 
+        start_embed_img = datetime.now(timezone.utc)
         if image_records:
             logger.info("[%s] Generating image embeddings...", document_id)
             img_embedder = get_image_embedder()
-            for record in image_records:
-                embed_text = build_image_embedding_text(record)
-                local_path = record.get("local_path")
-                vec = None
-                if local_path and os.path.exists(local_path):
-                    try:
-                        # Call Voyage multimodal interleaved embedding
-                        vec = img_embedder.embed_interleaved(embed_text, local_path)
-                    except Exception as img_exc:
-                        logger.warning("[%s] Interleaved image embedding failed: %s. Using text fallback.", document_id, img_exc)
-                if vec is None:
-                    vec = img_embedder.embed_text(embed_text)
+            embedding_inputs = [
+                (build_image_embedding_text(record), record.get("local_path"))
+                for record in image_records
+            ]
+            image_vectors = img_embedder.embed_interleaved_batch(embedding_inputs, document_id=document_id)
+            for record, vec in zip(image_records, image_vectors):
                 record["vector"] = vec
+        end_embed_img = datetime.now(timezone.utc)
+        logger.info("[%s] Ingestion step: IMAGE_EMBEDDING | Elapsed: %.2fs", document_id, (end_embed_img - start_embed_img).total_seconds())
 
         # ── Stage 5: Index Qdrant ─────────────────────────────────────────
-        set_status(document_id, "indexing_qdrant", total_pages=total_pages)
+        set_status(document_id, "indexing", total_pages=total_pages, message="Indexing vectors into Qdrant Cloud...")
         create_collections()
 
         # Determine target Qdrant collections
@@ -383,10 +424,19 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
             elif doc_type == "field_reports":
                 target_text_collection = "im_field_reports"
 
-        if text_chunks:
-            text_chunks_indexed = upsert_text_chunks(text_chunks, collection_name=target_text_collection)
-        if image_records:
-            images_indexed = upsert_image_chunks(image_records, collection_name=target_image_collection)
+        from retrieval.qdrant_service import set_indexing_threshold
+        set_indexing_threshold(0)
+        
+        start_index = datetime.now(timezone.utc)
+        try:
+            if text_chunks:
+                text_chunks_indexed = upsert_text_chunks(text_chunks, collection_name=target_text_collection)
+            if image_records:
+                images_indexed = upsert_image_chunks(image_records, collection_name=target_image_collection)
+        finally:
+            set_indexing_threshold(20000)
+        end_index = datetime.now(timezone.utc)
+        logger.info("[%s] Ingestion step: INDEXING | Elapsed: %.2fs", document_id, (end_index - start_index).total_seconds())
 
         # Save metadata to MongoDB/Local Fallback
         json_data["text_chunks_indexed"] = text_chunks_indexed
@@ -401,6 +451,7 @@ def process_document_background(document_id: str, file_path: str, metadata: dict
             text_chunks_indexed=text_chunks_indexed,
             images_indexed=images_indexed,
             total_pages=total_pages,
+            message="Completed"
         )
         logger.info("=== BACKGROUND PROCESSOR SUCCESS | doc=%s ===", document_id)
         

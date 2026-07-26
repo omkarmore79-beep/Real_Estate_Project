@@ -1,8 +1,13 @@
 """
-Semantic Chunker for the Hybrid Multimodal RAG pipeline.
-Splits page-level text into semantically cohesive chunks by analyzing the similarity
-between sentence embeddings. Preserves page-level OCR metadata, headings,
-and extracts real-estate-critical fields for downstream RAG retrieval.
+Fast Sliding-Window Chunker for the Hybrid Multimodal RAG pipeline.
+
+IMPORTANT: The previous "semantic chunker" called the Voyage embedding API on every
+individual sentence to compute cosine similarity — this caused 300-500 extra API calls
+per document BEFORE the actual embedding stage, completely overwhelming the Voyage TPM
+rate limit.
+
+This version uses a fast, pure-Python sliding window with token-aware splits on
+heading boundaries, producing high-quality chunks without any API calls during chunking.
 """
 
 from __future__ import annotations
@@ -10,15 +15,14 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-import math
 from typing import Any
-from retrieval.embeddings import get_text_embedder
 
 logger = logging.getLogger(__name__)
 
 # Target chunk size limits (in words)
-MIN_CHUNK_WORDS = 150
-MAX_CHUNK_WORDS = 800
+MIN_CHUNK_WORDS = 40
+MAX_CHUNK_WORDS = 320
+OVERLAP_WORDS = 40  # Sliding-window overlap for context preservation
 
 _SECTION_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("RERA", re.compile(r"\b(?:rera|maharera|registration\s+number)\b", re.IGNORECASE)),
@@ -46,111 +50,78 @@ _TAG_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("bhk", re.compile(r"\b\d\s*bhk\b", re.IGNORECASE)),
 ]
 
-def dot_product(v1: list[float], v2: list[float]) -> float:
-    return sum(x * y for x, y in zip(v1, v2))
+# Heading-like line pattern — used as natural split points
+_HEADING_PATTERN = re.compile(
+    r"^(?:[A-Z][A-Z\s]{3,40}|[0-9]+[\.\)]\s+[A-Z][^\n]{2,60}|\s*#{1,4}\s+.{3,60})$",
+    re.MULTILINE
+)
 
-def norm(v: list[float]) -> float:
-    return math.sqrt(sum(x * x for x in v))
 
-def cosine_similarity(v1: list[float], v2: list[float]) -> float:
-    n1, n2 = norm(v1), norm(v2)
-    if n1 == 0 or n2 == 0:
-        return 0.0
-    return dot_product(v1, v2) / (n1 * n2)
+def _split_on_headings(text: str) -> list[str]:
+    """Split text into sections by detecting heading-like lines."""
+    # Find all heading positions
+    boundaries = [0]
+    for m in _HEADING_PATTERN.finditer(text):
+        if m.start() > boundaries[-1] + 50:  # At least 50 chars between headings
+            boundaries.append(m.start())
+    boundaries.append(len(text))
 
-def percentile(values: list[float], p: float) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    k = (len(sorted_values) - 1) * p
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_values[int(k)]
-    d0 = sorted_values[int(f)] * (c - k)
-    d1 = sorted_values[int(c)] * (k - f)
-    return d0 + d1
+    sections = []
+    for i in range(len(boundaries) - 1):
+        section = text[boundaries[i]:boundaries[i + 1]].strip()
+        if section:
+            sections.append(section)
+    return sections if sections else [text]
 
-def split_into_sentences(text: str) -> list[str]:
-    """Split text into sentences using standard regex boundaries."""
-    # Matches . or ? or ! followed by space or newline, but ignores common abbreviations
-    sentence_end = re.compile(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s')
-    sentences = sentence_end.split(text)
-    return [s.strip() for s in sentences if s.strip()]
 
-def semantic_chunk_text(text: str, doc_id: str) -> list[str]:
+def sliding_window_chunk(text: str) -> list[str]:
     """
-    Split text into semantically cohesive chunks.
-    Embeds individual sentences, computes similarity between consecutive sentences,
-    and splits where similarity drops below the threshold.
+    Fast sliding-window chunker with heading-aware splits.
+    Zero API calls — pure Python.
     """
-    sentences = split_into_sentences(text)
-    if not sentences:
+    if not text or not text.strip():
         return []
-    if len(sentences) == 1:
-        return [sentences[0]]
 
-    # 1. Embed sentences in a single batch
-    try:
-        embedder = get_text_embedder()
-        embeddings = embedder.embed_batch(sentences)
-    except Exception as exc:
-        logger.warning("[%s] Failed to embed sentences for semantic chunking, falling back to word length splits: %s", doc_id, exc)
-        return _split_fallback(text)
-
-    # 2. Compute similarities between adjacent sentences
-    similarities = []
-    for i in range(len(sentences) - 1):
-        sim = cosine_similarity(embeddings[i], embeddings[i + 1])
-        similarities.append(sim)
-
-    # 3. Calculate threshold (e.g. 15th percentile of similarities)
-    # Splits will occur at local minima of similarity
-    threshold = percentile(similarities, 0.15) if similarities else 0.65
-    threshold = max(0.5, min(threshold, 0.85)) # Keep threshold in a reasonable range
-
+    # First try to split on headings for natural topic boundaries
+    sections = _split_on_headings(text)
     chunks = []
-    current_sentences = []
-    current_word_count = 0
 
-    for idx, sentence in enumerate(sentences):
-        sentence_words = len(sentence.split())
-        current_sentences.append(sentence)
-        current_word_count += sentence_words
+    for section in sections:
+        words = section.split()
+        if not words:
+            continue
 
-        # Check split conditions
-        should_split = False
-        
-        # Condition A: Not the last sentence, and similarity is below threshold
-        if idx < len(sentences) - 1:
-            next_similarity = similarities[idx]
-            if next_similarity < threshold and current_word_count >= MIN_CHUNK_WORDS:
-                should_split = True
-
-        # Condition B: Word count exceeds maximum hard limit
-        if current_word_count >= MAX_CHUNK_WORDS:
-            should_split = True
-
-        if should_split:
-            chunks.append(" ".join(current_sentences).strip())
-            current_sentences = []
-            current_word_count = 0
-
-    if current_sentences:
-        chunks.append(" ".join(current_sentences).strip())
+        if len(words) <= MAX_CHUNK_WORDS:
+            # Section fits in one chunk — keep it whole for best coherence
+            # Short safety warnings, figure explanations, and table rows are often
+            # the complete answer.  Dropping them made exact manual questions
+            # impossible to retrieve.
+            if len(words) >= 8:
+                chunks.append(section.strip())
+        else:
+            # Slide through long sections with overlap
+            start = 0
+            while start < len(words):
+                end = min(start + MAX_CHUNK_WORDS, len(words))
+                chunk_words = words[start:end]
+                # Prefer a sentence/table-row boundary near the end. This keeps
+                # specifications and warnings intact instead of splitting a value
+                # from its label.
+                if end < len(words):
+                    for cut in range(end, max(start + MIN_CHUNK_WORDS, end - 45), -1):
+                        if re.search(r"[.!?;:]$|\|$", words[cut - 1]):
+                            end = cut
+                            chunk_words = words[start:end]
+                            break
+                chunk_text = " ".join(chunk_words).strip()
+                if len(chunk_words) >= 8:
+                    chunks.append(chunk_text)
+                start = max(end - OVERLAP_WORDS, start + 1)
+                if start >= len(words):
+                    break
 
     return chunks
 
-def _split_fallback(text: str) -> list[str]:
-    """Word-length chunk split fallback."""
-    words = text.split()
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = min(start + 400, len(words))
-        chunks.append(" ".join(words[start:end]))
-        start += 300
-    return chunks
 
 def chunk_text_pages(
     pages: list[dict],
@@ -158,10 +129,18 @@ def chunk_text_pages(
     metadata: dict | None = None,
 ) -> list[dict]:
     """
-    Chunk page dicts (containing text + OCR metadata) into overlapping semantic segments.
+    Chunk page dicts into structure-aware chunks, extracting section/subsection,
+    identifying figure/table references, and linking chunks in a sequential list.
     """
     meta = metadata or {}
     chunks: list[dict] = []
+
+    current_section = "General"
+    current_subsection = ""
+
+    # Compile heading pattern for subsections/sections
+    # E.g. "1.2.3 Boom Cylinders" or "Sub-section A"
+    subsect_pattern = re.compile(r'^(?:[0-9]+(?:\.[0-9]+){2,}|[A-Za-z]\.)\s+([A-Z][A-Za-z\s]{2,40})')
 
     for page in pages:
         page_number = page.get("page_number", 0)
@@ -173,18 +152,34 @@ def chunk_text_pages(
         ocr_text = page.get("ocr_text") or ""
         ocr_used = page.get("ocr_used", False)
         ocr_confidence = page.get("ocr_confidence", 1.0)
-
-        # Classify the source type based on extraction method
-        if ocr_used:
-            source_type = "mixed" if pdf_text.strip() else "ocr"
-        else:
-            source_type = "pdf_text"
-
-        page_chunks = semantic_chunk_text(text, document_id)
+        page_section = page.get("section", current_section)
         
+        if page_section:
+            current_section = page_section
+
+        source_type = "mixed" if (ocr_used and pdf_text.strip()) else ("ocr" if ocr_used else "pdf_text")
+
+        # Split page text using sliding window
+        page_chunks = sliding_window_chunk(text)
+
         for chunk_index, chunk_text in enumerate(page_chunks):
             chunk_id = _make_chunk_id(document_id, page_number, chunk_index)
-            
+
+            # Detect subsection change in chunk text
+            for line in chunk_text.split("\n"):
+                line = line.strip()
+                sub_match = subsect_pattern.match(line)
+                if sub_match:
+                    current_subsection = line
+                    break
+
+            # Extract Figure/Table ID if referenced
+            fig_match = re.search(r'\b(Figure|Fig\.?|Diagram|Drawing)\s+(\d+[-.\d]*)\b', chunk_text, re.IGNORECASE)
+            figure_id = f"{fig_match.group(1)} {fig_match.group(2)}" if fig_match else ""
+
+            table_match = re.search(r'\[Table\]|\|\s*---\s*\|', chunk_text)
+            table_id = f"table_page_{page_number}_chk_{chunk_index}" if table_match else ""
+
             if meta.get("domain") == "excavator":
                 chunk_metadata = {
                     "doc_id": meta.get("doc_id", document_id),
@@ -195,7 +190,9 @@ def chunk_text_pages(
                     "revision_date": meta.get("revision_date", ""),
                     "ingested_at": meta.get("ingested_at", ""),
                     "page_number": page_number,
-                    "section_path": meta.get("section_path", ""),
+                    "section_path": f"{current_section} > {current_subsection}".strip(" > "),
+                    "section": current_section,
+                    "subsection": current_subsection,
                     "machine_model": meta.get("machine_model", "R215L"),
                     "component_tags": meta.get("component_tags", []),
                     "dtc_codes": meta.get("dtc_codes", []),
@@ -206,6 +203,11 @@ def chunk_text_pages(
                     "source_type": source_type,
                     "ocr_used": ocr_used,
                     "ocr_confidence": ocr_confidence,
+                    "figure_id": figure_id,
+                    "table_id": table_id,
+                    "version": meta.get("version", "1.0"),
+                    "prev_chunk_id": "",  # Linked below
+                    "next_chunk_id": "",  # Linked below
                 }
             else:
                 section_title = _detect_section(chunk_text)
@@ -225,6 +227,10 @@ def chunk_text_pages(
                     "ocr_confidence": ocr_confidence,
                     "tags": tags,
                     "domain": meta.get("domain", "real_estate"),
+                    "figure_id": figure_id,
+                    "table_id": table_id,
+                    "prev_chunk_id": "",  # Linked below
+                    "next_chunk_id": "",  # Linked below
                     **re_details,
                 }
 
@@ -237,16 +243,23 @@ def chunk_text_pages(
                 }
             )
 
+    # Link chunks sequentially to form a linked list (Context Traversal)
+    for idx in range(len(chunks)):
+        if idx > 0:
+            chunks[idx]["metadata"]["prev_chunk_id"] = chunks[idx - 1]["chunk_id"]
+        if idx < len(chunks) - 1:
+            chunks[idx]["metadata"]["next_chunk_id"] = chunks[idx + 1]["chunk_id"]
+
     logger.info(
-        "Created %d semantic chunks for document_id=%s across %d pages",
+        "Created %d chunks for document_id=%s across %d pages",
         len(chunks),
         document_id,
         len(pages),
     )
     return chunks
 
+
 def _detect_section(text: str) -> str:
-    """Return the most likely real-estate section title for a chunk."""
     best: tuple[str, int] = ("General", 0)
     for label, pattern in _SECTION_PATTERNS:
         count = len(pattern.findall(text))
@@ -254,12 +267,12 @@ def _detect_section(text: str) -> str:
             best = (label, count)
     return best[0]
 
+
 def _extract_tags(text: str) -> list[str]:
-    """Return a list of real-estate topic tags found in a chunk."""
     return [tag for tag, pattern in _TAG_PATTERNS if pattern.search(text)]
 
+
 def _extract_real_estate_details(text: str) -> dict:
-    """Extract key real estate details from chunk text using regex patterns."""
     rera_pattern = re.compile(
         r"(?:RERA\s+(?:No|Reg|Registration)?[:\-#\s]*)((?:PRM|P|RER|P\-)[A-Z0-9\-/]+)", re.IGNORECASE
     )
@@ -298,7 +311,7 @@ def _extract_real_estate_details(text: str) -> dict:
         "unit_type": unit_match.group(1).strip() if unit_match else "",
     }
 
+
 def _make_chunk_id(document_id: str, page_number: int, chunk_index: int) -> str:
-    """Create a deterministic chunk ID."""
     raw = f"{document_id}_p{page_number}_c{chunk_index}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, raw))

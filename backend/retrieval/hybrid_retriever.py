@@ -17,6 +17,7 @@ Pipeline:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Any
 from utils.cache import get_json_cache, set_json_cache
@@ -152,6 +153,10 @@ def retrieve(
     # Detect intent
     image_intent = detect_image_intent(query)
     should_search_images = include_images or image_intent["requires_image"]
+    # Type filtering prevents semantically weak full-page/filler images from
+    # outranking the diagram, plan, or table the user explicitly requested.
+    if image_intent["detected_types"]:
+        image_filters["image_type"] = image_intent["detected_types"]
 
     # 1. Multi-Query Expansion
     queries = expand_query(query)
@@ -214,7 +219,16 @@ def retrieve(
                     top_k=6,
                     collection_name=target_img_col
                 )
-            image_results = image_res
+            # Never return arbitrary page renders alongside a specific visual
+            # result. Full pages remain a last-resort option for scanned PDFs.
+            if image_intent["detected_types"]:
+                specific = [
+                    item for item in image_res
+                    if item.get("payload", {}).get("image_type") != "full_page"
+                ]
+                image_results = specific or image_res
+            else:
+                image_results = image_res
         except Exception as exc:
             logger.warning("Image search failed: %s", exc)
 
@@ -259,6 +273,51 @@ def retrieve(
         if confidence >= 0.35:
             confident_text.append(r)
 
+    # ── 7. Parent-Child Context Window Expansion ────────────────────────────
+    # For top-3 text results, fetch their prev/next chunk neighbours from Qdrant
+    # and append them as context-only entries (score=0, source_type=context_window)
+    try:
+        from retrieval.qdrant_service import get_chunks_by_ids
+        context_window_chunks: list[dict] = []
+        seen_ids: set[str] = {r["id"] for r in confident_text}
+
+        for r in confident_text[:3]:
+            meta = r.get("metadata", {})
+            neighbour_ids = []
+            if meta.get("prev_chunk_id"):
+                neighbour_ids.append(meta["prev_chunk_id"])
+            if meta.get("next_chunk_id"):
+                neighbour_ids.append(meta["next_chunk_id"])
+
+            if neighbour_ids:
+                neighbours = get_chunks_by_ids(neighbour_ids, collection_name=target_text_col)
+                for n in neighbours:
+                    if n["id"] not in seen_ids:
+                        seen_ids.add(n["id"])
+                        n_payload = n.get("payload", {})
+                        context_window_chunks.append({
+                            "id": n["id"],
+                            "score": 0.0,
+                            "source_type": "context_window",
+                            "content": n.get("content", ""),
+                            "document_id": n_payload.get("document_id", r.get("document_id", "")),
+                            "source_file": n_payload.get("source_file", ""),
+                            "page_number": n_payload.get("page_number"),
+                            "image_path": None,
+                            "image_url": None,
+                            "image_id": None,
+                            "image_type": None,
+                            "caption": None,
+                            "ocr_used": n_payload.get("ocr_used", False),
+                            "citation_id": f"ctx_{n['id'][:8]}",
+                            "metadata": n_payload,
+                            "confidence_score": 0.0,
+                        })
+
+        confident_text = confident_text + context_window_chunks
+    except Exception as exc:
+        logger.warning("Context window expansion failed: %s", exc)
+
     # Interleave: top text + top images, then slice to top_k
     final = _interleave(confident_text, image_only, top_k)
 
@@ -278,6 +337,10 @@ def detect_image_intent(query: str) -> dict:
     for phrase, img_type in _IMAGE_TYPE_MAP.items():
         if phrase in q and img_type not in detected_types:
             detected_types.append(img_type)
+
+    if re.search(r"\b(?:figure|fig\.?|diagram|drawing|schematic|graphic|illustration)\b", q):
+        if "diagram" not in detected_types:
+            detected_types.append("diagram")
 
     requires_image = any(phrase in q for phrase in _IMAGE_INTENT_PHRASES)
     return {"requires_image": requires_image, "detected_types": detected_types}

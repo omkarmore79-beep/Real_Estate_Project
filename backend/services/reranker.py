@@ -32,8 +32,12 @@ def get_chunk_text_representation(r: dict) -> str:
     Format a text or image chunk into a single cohesive string for reranking.
     Incorporates image captions, nearby paragraphs, and OCR labels.
     """
-    meta = r.get("metadata") or {}
-    if r.get("source_type") == "image":
+    # Qdrant results expose structured fields under ``payload`` while the
+    # application-normalized shape uses ``metadata``. Support both so the
+    # reranker never receives an empty document for image candidates.
+    meta = r.get("metadata") or r.get("payload") or {}
+    source_type = r.get("source_type") or ("image" if meta.get("image_id") else "text")
+    if source_type == "image":
         parts = []
         caption = r.get("caption") or meta.get("caption", "")
         if caption:
@@ -47,10 +51,10 @@ def get_chunk_text_representation(r: dict) -> str:
         
         # If nothing populated, fallback to content
         if not parts:
-            parts.append(r.get("content", ""))
+            parts.append(r.get("content", "") or meta.get("nearby_page_text", ""))
         return "\n".join(parts)
     else:
-        return r.get("content", "")
+        return r.get("content", "") or meta.get("content", "")
 
 def rerank_sync(query: str, chunks: List[dict], top_k: int = 10) -> List[dict]:
     """

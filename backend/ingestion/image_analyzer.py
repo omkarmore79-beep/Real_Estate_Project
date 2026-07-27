@@ -1,13 +1,13 @@
 import base64
 from io import BytesIO
 import json
+import logging
 import os
 import re
 
-from groq import Groq
+from config import ENABLE_GROQ_VISION, GROQ_VISION_MODEL
 
-
-VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+logger = logging.getLogger(__name__)
 VISION_MAX_IMAGE_SIDE = int(os.getenv("VISION_MAX_IMAGE_SIDE", "1400"))
 VISION_MAX_IMAGE_BYTES = int(os.getenv("VISION_MAX_IMAGE_BYTES", "900000"))
 
@@ -502,56 +502,76 @@ Existing OCR/text extraction:
 """.strip()
 
 
+def _is_groq_vision_available() -> bool:
+    return ENABLE_GROQ_VISION and bool(GROQ_VISION_MODEL) and bool(os.getenv("GROQ_API_KEY"))
+
+
+def _log_groq_vision_analysis_failure(exc: Exception):
+    reason = str(exc)
+    if hasattr(exc, "status_code"):
+        reason = f"HTTP {getattr(exc, 'status_code')} - {reason}"
+    logger.warning(
+        "Groq Vision analysis unavailable. Switching to text fallback.\nReason: %s",
+        reason,
+    )
+
+
 def _analyze_with_vision(image, page_text):
     local_path = image.get("local_path")
-    if not local_path or not os.path.exists(local_path) or not os.getenv("GROQ_API_KEY"):
+    if not local_path or not os.path.exists(local_path) or not _is_groq_vision_available():
         return None
 
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    response = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _vision_prompt(image.get("page"), page_text)},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": _image_data_url(local_path)},
-                    },
-                ],
-            }
-        ],
-        temperature=0.1,
-        max_tokens=900,
-    )
-    content = response.choices[0].message.content
-    parsed = json.loads(_clean_llm_json(content))
+    try:
+        from groq import Groq
 
-    page_slug = _slug_from_label(parsed.get("page_type"))
-    definition = _definition_by_slug(page_slug)
-    image_type = _normalize_image_type(parsed.get("image_type"), definition["label"])
-    tags = _unique(
-        [
-            *definition["implicit_tags"],
-            *definition["keywords"],
-            *(parsed.get("searchable_tags") or []),
-        ]
-    )
-    extracted_text = parsed.get("extracted_text") or page_text or ""
-    entities = _unique([*(parsed.get("detected_entities") or []), *_extract_entities(extracted_text)])
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _vision_prompt(image.get("page"), page_text)},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _image_data_url(local_path)},
+                        },
+                    ],
+                }
+            ],
+            temperature=0.1,
+            max_tokens=900,
+        )
+        content = response.choices[0].message.content
+        parsed = json.loads(_clean_llm_json(content))
 
-    return {
-        "page": image.get("page"),
-        "page_type": definition["label"],
-        "image_type": image_type,
-        "description": parsed.get("description") or f"Page {image.get('page')} is a {definition['label'].lower()}.",
-        "searchable_tags": tags,
-        "detected_entities": entities,
-        "extracted_text": extracted_text,
-        "image_references": [image.get("image_id")] if image.get("image_id") else [],
-        "analysis_source": "vision_llm",
-    }
+        page_slug = _slug_from_label(parsed.get("page_type"))
+        definition = _definition_by_slug(page_slug)
+        image_type = _normalize_image_type(parsed.get("image_type"), definition["label"])
+        tags = _unique(
+            [
+                *definition["implicit_tags"],
+                *definition["keywords"],
+                *(parsed.get("searchable_tags") or []),
+            ]
+        )
+        extracted_text = parsed.get("extracted_text") or page_text or ""
+        entities = _unique([*(parsed.get("detected_entities") or []), *_extract_entities(extracted_text)])
+
+        return {
+            "page": image.get("page"),
+            "page_type": definition["label"],
+            "image_type": image_type,
+            "description": parsed.get("description") or f"Page {image.get('page')} is a {definition['label'].lower()}.",
+            "searchable_tags": tags,
+            "detected_entities": entities,
+            "extracted_text": extracted_text,
+            "image_references": [image.get("image_id")] if image.get("image_id") else [],
+            "analysis_source": "vision_llm",
+        }
+    except Exception as exc:
+        _log_groq_vision_analysis_failure(exc)
+        return None
 
 
 def analyze_page(image, page_texts=None):

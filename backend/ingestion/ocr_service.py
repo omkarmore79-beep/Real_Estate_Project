@@ -3,11 +3,19 @@ import os
 import cv2
 import numpy as np
 from PIL import Image
-from config import OCR_ENABLED, OCR_ENGINE, OCR_MIN_TEXT_LENGTH, OCR_MIN_CONFIDENCE
+from config import (
+    ENABLE_GROQ_VISION,
+    GROQ_VISION_MODEL,
+    OCR_ENABLED,
+    OCR_ENGINE,
+    OCR_MIN_TEXT_LENGTH,
+    OCR_MIN_CONFIDENCE,
+)
 
 logger = logging.getLogger(__name__)
 
 _ocr_engine = None
+_groq_vision_unavailable_logged = False
 
 class OCRResult:
     """Structured container for OCR extraction results."""
@@ -24,15 +32,75 @@ def get_ocr_engine():
         return None
     if _ocr_engine is None:
         try:
+            # Disable oneDNN/MKLDNN PIR executor on Windows CPU to prevent oneDNN instruction crash
+            os.environ["FLAGS_use_onednn"] = "0"
+            os.environ["FLAGS_use_mkldnn"] = "0"
+            os.environ["PADDLE_DISABLE_PIR"] = "1"
+
             from paddleocr import PaddleOCR
             # Suppress excessive logging from PaddleOCR
             logging.getLogger("ppocr").setLevel(logging.WARNING)
-            _ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+            _ocr_engine = PaddleOCR(lang="en", use_angle_cls=False, enable_mkldnn=False)
             logger.info("PaddleOCR engine initialized successfully.")
         except Exception as exc:
             logger.error("Failed to initialize PaddleOCR engine: %s", exc)
             _ocr_engine = None
     return _ocr_engine
+
+
+def _groq_vision_warning_once(reason: str):
+    global _groq_vision_unavailable_logged
+    if not _groq_vision_unavailable_logged:
+        logger.warning(
+            "Groq Vision unavailable. Switching to PaddleOCR.\nReason: %s",
+            reason,
+        )
+        _groq_vision_unavailable_logged = True
+
+
+def _get_groq_vision_reason(exc: Exception) -> str:
+    reason = ""
+    if hasattr(exc, "status_code"):
+        reason += f"HTTP {getattr(exc, 'status_code')} "
+    if hasattr(exc, "code"):
+        reason += f"{getattr(exc, 'code')} "
+    reason += str(exc)
+    reason = reason.strip()
+    if not reason:
+        return "Unknown Groq Vision error"
+    return reason
+
+
+def _run_paddle_ocr(image_path_or_pil) -> OCRResult:
+    engine = get_ocr_engine()
+    if not engine:
+        return OCRResult("", 0.0, "none", ["PaddleOCR engine failed to initialize"])
+
+    try:
+        processed = preprocess_image_for_ocr(image_path_or_pil)
+        if processed is None:
+            return OCRResult("", 0.0, "paddle", ["Image preprocessing returned None"])
+
+        result = engine.ocr(processed)
+        if not result or not result[0]:
+            return OCRResult("", 1.0, "paddle", ["No text detected on the page image"])
+
+        texts = []
+        confidences = []
+        for line in result[0]:
+            if not line:
+                continue
+            box, (text_val, conf) = line
+            texts.append(text_val)
+            confidences.append(conf)
+
+        ocr_text = "\n".join(texts)
+        avg_conf = sum(confidences) / len(confidences) if confidences else 1.0
+        return OCRResult(ocr_text, avg_conf, "paddle")
+    except Exception as exc:
+        logger.error("OCR execution failed: %s", exc)
+        return OCRResult("", 0.0, "paddle", [f"OCR execution error: {exc}"])
+
 
 def preprocess_image_for_ocr(image_path_or_pil):
     """
@@ -73,38 +141,94 @@ def preprocess_image_for_ocr(image_path_or_pil):
             return cv2.cvtColor(np.array(image_path_or_pil), cv2.COLOR_RGB2BGR)
         return cv2.imread(image_path_or_pil) if isinstance(image_path_or_pil, str) else image_path_or_pil
 
-def run_ocr_on_image(image_path_or_pil) -> OCRResult:
-    """Execute OCR engine on a file path or PIL image."""
-    engine = get_ocr_engine()
-    if not engine:
-        return OCRResult("", 0.0, "none", ["OCR engine is disabled or failed to initialize"])
+def run_ocr_with_groq_vision(image_path_or_pil) -> OCRResult:
+    """Run OCR on a page image using Groq Vision API when configured."""
+    if not ENABLE_GROQ_VISION or not GROQ_VISION_MODEL:
+        reason = "Groq Vision is disabled or GROQ_VISION_MODEL is not configured."
+        _groq_vision_warning_once(reason)
+        return OCRResult("", 0.0, "groq", [reason])
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        reason = "GROQ_API_KEY is not set."
+        _groq_vision_warning_once(reason)
+        return OCRResult("", 0.0, "groq", [reason])
+
+    import base64
+    from io import BytesIO
+    from groq import Groq
 
     try:
-        processed = preprocess_image_for_ocr(image_path_or_pil)
-        if processed is None:
-            return OCRResult("", 0.0, "paddle", ["Image preprocessing returned None"])
+        if isinstance(image_path_or_pil, str):
+            with open(image_path_or_pil, "rb") as f:
+                img_bytes = f.read()
+        elif isinstance(image_path_or_pil, Image.Image):
+            buffer = BytesIO()
+            image_path_or_pil.convert("RGB").save(buffer, format="JPEG", quality=80)
+            img_bytes = buffer.getvalue()
+        else:
+            pil_img = Image.fromarray(cv2.cvtColor(image_path_or_pil, cv2.COLOR_BGR2RGB))
+            buffer = BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=80)
+            img_bytes = buffer.getvalue()
 
-        # Execute PaddleOCR
-        result = engine.ocr(processed, cls=True)
-        
-        if not result or not result[0]:
-            return OCRResult("", 1.0, "paddle", ["No text detected on the page image"])
+        encoded = base64.b64encode(img_bytes).decode("ascii")
+        data_url = f"data:image/jpeg;base64,{encoded}"
 
-        texts = []
-        confidences = []
-        for line in result[0]:
-            if not line:
-                continue
-            box, (text_val, conf) = line
-            texts.append(text_val)
-            confidences.append(conf)
+        client = Groq(api_key=api_key)
+        logger.info("Attempting Groq Vision OCR with model: %s", GROQ_VISION_MODEL)
+        response = client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Transcribe all readable text from this document image. "
+                                "Output ONLY the transcribed text. Do not add any introduction, "
+                                "meta-explanation, or markdown formatting outside of structural "
+                                "formatting (like tables or lists) that exist in the image."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                }
+            ],
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        ocr_text = response.choices[0].message.content or ""
+        if not ocr_text.strip():
+            reason = "Groq Vision returned empty OCR text."
+            _groq_vision_warning_once(reason)
+            return OCRResult("", 0.0, "groq", [reason])
 
-        ocr_text = "\n".join(texts)
-        avg_conf = sum(confidences) / len(confidences) if confidences else 1.0
-        return OCRResult(ocr_text, avg_conf, "paddle")
+        logger.info("Groq Vision OCR succeeded with model: %s", GROQ_VISION_MODEL)
+        return OCRResult(ocr_text.strip(), 1.0, "groq")
     except Exception as exc:
-        logger.error("OCR execution failed: %s", exc)
-        return OCRResult("", 0.0, "paddle", [f"OCR execution error: {exc}"])
+        reason = _get_groq_vision_reason(exc)
+        _groq_vision_warning_once(reason)
+        return OCRResult("", 0.0, "groq", [reason])
+
+def run_ocr_on_image(image_path_or_pil) -> OCRResult:
+    """Execute OCR engine on a file path or PIL image."""
+    if not OCR_ENABLED:
+        return OCRResult("", 0.0, "none", ["OCR engine is disabled"])
+
+    if OCR_ENGINE.lower() == "groq":
+        groq_result = run_ocr_with_groq_vision(image_path_or_pil)
+        if groq_result.text:
+            return groq_result
+        logger.info("Groq Vision OCR failed or unavailable; falling back to PaddleOCR.")
+        return _run_paddle_ocr(image_path_or_pil)
+
+    return _run_paddle_ocr(image_path_or_pil)
+
 
 def run_ocr_on_page_pixmap(page) -> OCRResult:
     """Render a PyMuPDF Page to a pixmap, then run OCR on the rendered image data."""
@@ -123,20 +247,13 @@ def run_ocr_on_page_pixmap(page) -> OCRResult:
 def should_run_ocr(extracted_text: str, page_images_count: int = 0) -> bool:
     """
     Decide if OCR needs to run on this page:
-      - extracted_text is empty
-      - extracted_text length is smaller than OCR_MIN_TEXT_LENGTH
+      - Returns True ONLY if direct text extraction returned fewer than 15 characters (scanned image page).
     """
     if not OCR_ENABLED:
         return False
     
     clean_text = (extracted_text or "").strip()
-    if not clean_text:
-        return True
-    
-    if len(clean_text) < OCR_MIN_TEXT_LENGTH:
-        return True
-        
-    return False
+    return len(clean_text) < 15
 
 def merge_extracted_and_ocr_text(extracted_text: str, ocr_text: str) -> str:
     """Concatenate normal extracted text with OCR text cleanly."""

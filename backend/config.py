@@ -11,8 +11,11 @@ Qdrant validation rules:
 
 import os
 import sys
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -22,6 +25,8 @@ _env_source = str(BASE_DIR / ".env")
 # ── Groq / LLM ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "").strip()
+ENABLE_GROQ_VISION = os.getenv("ENABLE_GROQ_VISION", "false").lower() == "true"
 
 # ── MongoDB ────────────────────────────────────────────────────────────────────
 MONGODB_URI = os.getenv("MONGODB_URI")
@@ -50,41 +55,41 @@ except Exception:
 
 # ── Qdrant validation ─────────────────────────────────────────────────────────
 if not QDRANT_URL:
-    print(
-        "\n[CONFIG ERROR] QDRANT_URL is not set.\n"
-        f"  .env loaded from: {_env_source}\n"
-        "  Add QDRANT_URL=<your-qdrant-cloud-url> to your .env file and restart.\n",
-        file=sys.stderr,
-    )
+    logger.error("QDRANT_URL is not set (dotenv source: %s).", _env_source)
     raise EnvironmentError(
         "QDRANT_URL is required. Set it in your .env file."
     )
 
 _is_cloud = "cloud.qdrant.io" in QDRANT_URL
 if _is_cloud and not QDRANT_API_KEY:
-    print(
-        "\n[CONFIG ERROR] QDRANT_URL points to Qdrant Cloud but QDRANT_API_KEY is not set.\n"
-        "  Add QDRANT_API_KEY=<your-api-key> to your .env file and restart.\n",
-        file=sys.stderr,
-    )
+    logger.error("QDRANT_API_KEY is required for Qdrant Cloud (%s).", _qdrant_host)
     raise EnvironmentError(
         "QDRANT_API_KEY is required when connecting to Qdrant Cloud."
     )
 
+# ── Voyage AI ─────────────────────────────────────────────────────────────────
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+
 # ── Embedding & Reranker Models ────────────────────────────────────────────────
-TEXT_EMBEDDING_MODEL = os.getenv("TEXT_EMBEDDING_MODEL", "BAAI/bge-m3")
-IMAGE_EMBEDDING_MODEL = os.getenv("IMAGE_EMBEDDING_MODEL", "jinaai/jina-clip-v2")
+TEXT_EMBEDDING_MODEL = os.getenv("TEXT_EMBEDDING_MODEL", "voyage-3")
+IMAGE_EMBEDDING_MODEL = os.getenv("IMAGE_EMBEDDING_MODEL", "voyage-multimodal-3.5")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
+VOYAGE_RERANK_MODEL = os.getenv("VOYAGE_RERANK_MODEL", "rerank-2")
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "50"))
+FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "10"))
+RERANK_TIMEOUT = int(os.getenv("RERANK_TIMEOUT", "30"))
+VOYAGE_TPM_LIMIT = int(os.getenv("VOYAGE_TPM_LIMIT", "20000"))
 
 # Vector dimensions
-TEXT_VECTOR_DIM = int(os.getenv("TEXT_VECTOR_DIM", "1024"))   # bge-m3 dense dim
-IMAGE_VECTOR_DIM = int(os.getenv("IMAGE_VECTOR_DIM", "512"))  # jina-clip-v2 / CLIP
+TEXT_VECTOR_DIM = int(os.getenv("TEXT_VECTOR_DIM", "1024"))   # Voyage dense dim
+IMAGE_VECTOR_DIM = int(os.getenv("IMAGE_VECTOR_DIM", "1024"))  # Voyage multimodal dim
 
 # ── OCR ────────────────────────────────────────────────────────────────────────
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").lower() == "true"
 OCR_ENGINE = os.getenv("OCR_ENGINE", "paddle")
 OCR_MIN_TEXT_LENGTH = int(os.getenv("OCR_MIN_TEXT_LENGTH", "80"))
 OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "0.60"))
+OCR_ON_CROPPED_IMAGES = os.getenv("OCR_ON_CROPPED_IMAGES", "false").lower() == "true"
 
 # ── Storage Paths ──────────────────────────────────────────────────────────────
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "..", "uploads")
@@ -93,18 +98,11 @@ RAW_FOLDER = os.path.join(BASE_DIR, "storage", "raw_text")
 IMAGE_FOLDER = os.path.join(BASE_DIR, "storage", "images")
 
 # ── Startup diagnostics (never print secrets) ─────────────────────────────────
-print(f"[CONFIG] .env loaded from   : {_env_source}")
-print(f"MongoDB URI configured: {'true' if MONGODB_URI else 'false'}")
-print(f"MongoDB DB name: {MONGODB_DB}")
-print(f"MongoDB collection name: {MONGODB_COLLECTION}")
-print(f"Qdrant URL configured: {'true' if QDRANT_URL else 'false'}")
-print(f"Qdrant URL host: {_qdrant_host}")
-print(f"OCR enabled: {'true' if OCR_ENABLED else 'false'}")
-print(f"ALLOW_UPLOAD_WITHOUT_MONGODB: {'true' if ALLOW_UPLOAD_WITHOUT_MONGODB else 'false'}")
-print(f"[CONFIG] LLM model          : {LLM_MODEL}")
-print(f"[CONFIG] Text embed model   : {TEXT_EMBEDDING_MODEL}")
-print(f"[CONFIG] Image embed model  : {IMAGE_EMBEDDING_MODEL}")
-print(f"[CONFIG] Reranker model     : {RERANKER_MODEL}")
-
+logger.info("Configuration loaded from %s", _env_source)
+logger.info("MongoDB configured=%s db=%s collection=%s", bool(MONGODB_URI), MONGODB_DB, MONGODB_COLLECTION)
+logger.info("Qdrant configured=%s host=%s", bool(QDRANT_URL), _qdrant_host)
+logger.info("OCR enabled=%s; upload_without_mongodb=%s; groq_vision_enabled=%s", OCR_ENABLED, ALLOW_UPLOAD_WITHOUT_MONGODB, ENABLE_GROQ_VISION)
+logger.info("Groq Vision model configured=%s", bool(GROQ_VISION_MODEL))
+logger.info("Models: llm=%s text=%s image=%s reranker=%s", LLM_MODEL, TEXT_EMBEDDING_MODEL, IMAGE_EMBEDDING_MODEL, VOYAGE_RERANK_MODEL)
 
 

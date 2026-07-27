@@ -1,16 +1,25 @@
 import { Plus, Upload } from "lucide-react";
+import { cookies } from "next/headers";
 import { DocumentActions } from "@/components/document-actions";
 import { Badge, ButtonLink, PageHeader } from "@/components/ui";
 import { getBuilderGroups, getDocumentType, getProjectTitle, getUploadDate } from "@/lib/backend-data";
 
 export default async function BuildersPage() {
-  const builders = await getBuilderGroups();
+  const cookieStore = cookies();
+  const domain = cookieStore.get("domain")?.value || "real-estate";
+  const builders = await getBuilderGroups(domain);
+  const isMachinery = domain === "machinery";
+  
+  const title = isMachinery ? "Manufacturers" : "Builders";
+  const description = isMachinery 
+    ? "Manufacturer details detected from uploaded technical manuals." 
+    : "Builder details detected from uploaded project documents.";
 
   return (
     <>
       <PageHeader
-        title="Builders"
-        description="Builder details detected from uploaded project documents."
+        title={title}
+        description={description}
         action={
           <ButtonLink href="/documents/upload">
             <Plus className="h-4 w-4" />
@@ -70,7 +79,7 @@ export default async function BuildersPage() {
           ))
         ) : (
           <div className="panel p-8 text-center text-sm text-muted-foreground">
-            No builders found yet. They will appear after you upload and process a real brochure.
+            {isMachinery ? "No manufacturers found yet. They will appear after you upload and process a technical manual." : "No builders found yet. They will appear after you upload and process a real estate brochure."}
           </div>
         )}
       </div>

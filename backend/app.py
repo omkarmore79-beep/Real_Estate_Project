@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import uuid
+import hashlib
 from typing import Any
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Response, UploadFile
@@ -77,9 +78,9 @@ logger = logging.getLogger(__name__)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Real Estate Hybrid Multimodal RAG API",
+    title="Hybrid Multimodal RAG API",
     description=(
-        "Grounded answers from uploaded real estate brochures. "
+        "Grounded answers from uploaded technical and multimodal documents. "
         "Upload returns immediately; RAG indexing runs in the background."
     ),
     version="3.1.0",
@@ -134,11 +135,25 @@ def clean_llm_output(text: str) -> str:
     return text
 
 
-def _is_pdf(content_type: str | None, filename: str) -> bool:
-    if content_type and "pdf" in content_type.lower():
+def _is_supported_format(content_type: str | None, filename: str) -> bool:
+    ext = os.path.splitext(filename)[1].lower()
+    supported_extensions = {
+        ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt",
+        ".png", ".jpg", ".jpeg", ".webp"
+    }
+    if ext in supported_extensions:
         return True
-    if filename and filename.lower().endswith(".pdf"):
-        return True
+    if content_type:
+        lower_mime = content_type.lower()
+        supported_mimes = {
+            "application/pdf", 
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "text/csv", "text/plain", "image/png", "image/jpeg", "image/webp"
+        }
+        if lower_mime in supported_mimes:
+            return True
     return False
 
 
@@ -156,23 +171,27 @@ async def upload_pdf(
     document_type: str | None = Form(default=None),
     description: str | None = Form(default=None),
     tags: str | None = Form(default=None),
+    # Excavator Domain Fields
+    domain: str | None = Form(default="real_estate"),
+    doc_type: str | None = Form(default=None),
+    revision_date: str | None = Form(default=None),
+    section_path: str | None = Form(default=None),
+    component_tags: str | None = Form(default=None),
+    dtc_codes: str | None = Form(default=None),
+    supersedes_doc_id: str | None = Form(default=None),
 ):
     """
-    Upload a real-estate PDF.
-
-    Returns immediately with status="processing".
-    RAG indexing (extraction → embedding → Qdrant Cloud) runs in background.
-    Poll GET /documents/{document_id}/status for progress.
+    Upload a real-estate or excavator document.
     """
     # ── Validate file ─────────────────────────────────────────────────────────
     if file is None or not file.filename:
         raise HTTPException(status_code=400, detail="No file was uploaded.")
 
     safe_filename = os.path.basename(file.filename)
-    if not _is_pdf(file.content_type, safe_filename):
+    if not _is_supported_format(file.content_type, safe_filename):
         raise HTTPException(
             status_code=400,
-            detail=f"Only PDF files are accepted. Got: {file.content_type or safe_filename}",
+            detail=f"Unsupported file format. Supported: PDF, DOCX, PPTX, XLSX, CSV, TXT, PNG, JPEG, WEBP. Got: {file.content_type or safe_filename}",
         )
 
     document_id = uuid.uuid4().hex
@@ -215,14 +234,88 @@ async def upload_pdf(
             )
 
 
+    if domain == "excavator":
+        if not doc_type:
+            raise HTTPException(status_code=400, detail="For excavator domain, 'doc_type' is required.")
+        valid_types = {"manuals", "service_bulletins", "maintenance_logs", "parts_catalog", "field_reports"}
+        if doc_type.lower() not in valid_types:
+            raise HTTPException(status_code=400, detail=f"Invalid doc_type for excavator. Must be one of: {list(valid_types)}")
+
     logger.info("=== UPLOAD START | doc=%s | file=%s ===", document_id, safe_filename)
 
-    # Read bytes eagerly — must happen before any async context switch
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) < 100:
-        raise HTTPException(status_code=400, detail="Uploaded file appears to be empty or corrupt.")
+    # Read bytes eagerly
+    file_bytes = await file.read()
+    if len(file_bytes) < 10:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty or corrupt.")
 
-    logger.info("[%s] PDF read: %d bytes", document_id, len(pdf_bytes))
+    # Eagerly compute hash and check for duplicates to save computing time
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    
+    # ── Verify duplicates in MongoDB ─────────────────────────────────────────
+    existing_doc = None
+    try:
+        from storage.mongo_store import _get_collection, _load_projects_locally
+        col = _get_collection()
+        if col is not None:
+            existing_doc = col.find_one({"hash": file_hash})
+        if not existing_doc:
+            local_projects = _load_projects_locally(include_raw_text=True)
+            for p in local_projects:
+                if p.get("hash") == file_hash:
+                    existing_doc = p
+                    break
+    except Exception as exc:
+        logger.warning("[%s] Duplicate check exception: %s", document_id, exc)
+
+    if existing_doc:
+        # Reuse the already indexed document and return its existing document_id.
+        try:
+            from storage.mongo_store import save_project_to_mongo
+            existing_doc_id = existing_doc.get("document_id")
+            reused_doc = dict(existing_doc)
+            reused_doc["document_id"] = existing_doc_id
+            reused_doc["source_file"] = safe_filename
+            reused_doc["stored_file"] = f"{existing_doc_id}_{safe_filename}"
+            reused_doc["domain"] = domain
+            
+            reused_meta = reused_doc.get("metadata", {}) or {}
+            if title: reused_meta["title"] = title
+            if builder: reused_meta["builder"] = builder
+            if project: reused_meta["project"] = project
+            if document_type: reused_meta["document_type"] = document_type
+            if description: reused_meta["description"] = description
+            if tags: reused_meta["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            
+            # Excavator specific
+            if doc_type: reused_meta["doc_type"] = doc_type
+            if revision_date: reused_meta["revision_date"] = revision_date
+            if section_path: reused_meta["section_path"] = section_path
+            if component_tags: reused_meta["component_tags"] = [t.strip() for t in component_tags.split(",") if t.strip()]
+            if dtc_codes: reused_meta["dtc_codes"] = [t.strip() for t in dtc_codes.split(",") if t.strip()]
+            if supersedes_doc_id: reused_meta["supersedes_doc_id"] = supersedes_doc_id
+            reused_doc["metadata"] = reused_meta
+            
+            save_project_to_mongo(reused_doc)
+            save_initial_status(existing_doc_id, status="ready", progress=100, filename=safe_filename)
+            set_status(existing_doc_id, "ready", 
+                       text_chunks_indexed=reused_doc.get("text_chunks_indexed", 0),
+                       images_indexed=reused_doc.get("images_indexed", 0),
+                       total_pages=len(reused_doc.get("pages", [])),
+                       message="Duplicate document detected. Reused existing indexed document.")
+            
+            return {
+                "document_id": existing_doc_id,
+                "status": "ready",
+                "progress": 100,
+                "filename": safe_filename,
+                "message": "Duplicate document detected. Reused existing indexed document.",
+                "saved_to_mongodb": mongo_ok,
+                "ocr_used": False,
+            }
+        except Exception as exc:
+            logger.warning("[%s] Failed to reuse deduplicated document: %s", document_id, exc)
+
+    logger.info("[%s] File read: %d bytes", document_id, len(file_bytes))
 
     # Mark status immediately so frontend polling starts working
     save_initial_status(document_id, status="uploaded", progress=5, filename=safe_filename)
@@ -233,7 +326,7 @@ async def upload_pdf(
     file_path = os.path.join(UPLOAD_FOLDER, stored_filename)
     try:
         with open(file_path, "wb") as buf:
-            buf.write(pdf_bytes)
+            buf.write(file_bytes)
         logger.info("[%s] Saved uploaded file permanently to %s", document_id, file_path)
     except Exception as exc:
         logger.error("[%s] Failed to save uploaded file permanently: %s", document_id, exc)
@@ -242,6 +335,7 @@ async def upload_pdf(
 
     # Enqueue background task
     metadata = {
+        "domain": domain,
         "source_file": safe_filename,
         "content_type": file.content_type or "application/pdf",
         "title": title or "",
@@ -250,6 +344,13 @@ async def upload_pdf(
         "document_type": document_type or "",
         "description": description or "",
         "tags": tags or "",
+        # Excavator specific
+        "doc_type": doc_type or "",
+        "revision_date": revision_date or "",
+        "section_path": section_path or "",
+        "component_tags": component_tags or "",
+        "dtc_codes": dtc_codes or "",
+        "supersedes_doc_id": supersedes_doc_id or "",
     }
     
     enqueue_document_processing(
@@ -319,6 +420,7 @@ async def document_status(document_id: str):
         "total_pages": status.get("total_pages", 0),
         "message": status.get("message", ""),
         "error": status.get("error", ""),
+        "ocr_used": status.get("ocr_used", False),
     }
 
 
@@ -326,19 +428,69 @@ async def document_status(document_id: str):
 #  CHAT — Hybrid RAG with readiness guard and legacy fallback
 # ════════════════════════════════════════════════════════════════════════════════
 
+def route_query_with_llm(query: str) -> str:
+    """
+    LLM Router Node: Classifies query into 'chit_chat', 'real_estate', or 'visual_image'.
+    """
+    from chatbot.grounded_answer import _get_groq_client, _get_llm_model
+    client = _get_groq_client()
+    model = _get_llm_model()
+    
+    prompt = f"""You are an advanced routing assistant for a real estate chatbot.
+Classify the following user query into exactly one of three categories:
+1. 'chit_chat': If the query is a greeting, small talk, question about your identity, thank you, or general casual conversation (e.g., 'hi', 'hello', 'how are you', 'thank you', 'who made you').
+2. 'visual_image': If the query specifically requests images, diagrams, floor plans, layouts, site plans, photos, or maps (e.g., 'show me the floor plan', 'list of images', 'visual drawings', 'diagrams').
+3. 'real_estate': If the query asks for specific text details, specifications, RERA ID, prices, amenities, dates, developer details, or other brochure facts (e.g., 'what is the price', 'tell me about the amenities', 'RERA registration number').
+
+User Query: "{query}"
+
+Output ONLY the category name ('chit_chat', 'visual_image', or 'real_estate') in lowercase. Do not include any other text."""
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=10
+        )
+        decision = response.choices[0].message.content.strip().lower()
+        if "chit_chat" in decision or "chitchat" in decision:
+            return "chit_chat"
+        elif "visual" in decision or "image" in decision:
+            return "visual_image"
+        else:
+            return "real_estate"
+    except Exception as e:
+        logger.warning("LLM Routing failed, falling back to rule-based: %s", e)
+        # Fallback to rule-based check
+        q_lower = query.lower().strip()
+        greetings = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening", "howdy", "yo"}
+        small_talk_words = {"how are you", "who are you", "what is your name", "who made you", "tell me a joke", "what's up", "help", "thank you", "thanks", "bye", "goodbye"}
+        if q_lower in greetings or any(w in q_lower for w in small_talk_words):
+            return "chit_chat"
+        if any(w in q_lower for w in ["diagram", "image", "photo", "floor plan", "layout", "drawing", "map"]):
+            return "visual_image"
+        return "real_estate"
+
 @app.post("/chat")
 async def chat(query: Any = Body(...)):
     document_id = None
+    session_id = "default"
     top_k = 8
     include_images = False
+    domain = "real_estate"
 
     if isinstance(query, dict):
         document_id = query.get("document_id")
+        session_id = query.get("session_id", "default")
         include_images = bool(query.get("include_images", False))
         top_k = int(query.get("top_k", 8))
-        query = query.get("message") or query.get("query") or ""
+        domain = query.get("domain", "real_estate")
+        question = query.get("message") or query.get("query") or ""
+    else:
+        question = str(query)
 
-    question = str(query).strip()
+    question = str(question).strip()
     if not question:
         return {
             "question": "",
@@ -346,6 +498,75 @@ async def chat(query: Any = Body(...)):
             "citations": [],
             "images": [],
             "confidence": "low",
+        }
+
+    # 1. Load Session History
+    from utils.memory import memory_manager
+    session = memory_manager.get_session(session_id)
+    history = session.get_history()
+
+    # 2. Standalone query rewriting for follow-up questions
+    stand_alone_question = question
+    if history:
+        try:
+            from chatbot.grounded_answer import _get_groq_client
+            client = _get_groq_client()
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-4:]])
+            rewrite_prompt = f"""Given the following chat history and follow-up question, rewrite it into a single standalone search query.
+If it is already standalone, return it as is. Do not include prefix/suffix.
+
+Chat History:
+{history_str}
+
+Follow-up: {question}
+Standalone:"""
+            res = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": rewrite_prompt}],
+                temperature=0.1,
+                max_tokens=128
+            )
+            stand_alone_question = res.choices[0].message.content.strip()
+            logger.info("Rewrote follow-up question to standalone: %s", stand_alone_question)
+        except Exception as e:
+            logger.warning("Failed to rewrite query with history: %s", e)
+
+    # 3. LLM Router Node classification
+    route_decision = route_query_with_llm(stand_alone_question)
+    logger.info("LLM Router Node classified query as: %s", route_decision)
+
+    if route_decision == "chit_chat":
+        # Run Chit-Chat Node
+        from chatbot.grounded_answer import _get_groq_client, _get_llm_model
+        client = _get_groq_client()
+        model = _get_llm_model()
+        messages = [{"role": "system", "content": "You are a helpful, professional AI assistant. Reply to the user's greeting or question naturally and concisely."}]
+        for msg in history[-6:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": question})
+        
+        try:
+            res = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=256
+            )
+            answer = res.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error("Smalltalk LLM call failed: %s", e)
+            answer = "Hello! How can I help you today?"
+            
+        session.add_message("user", question)
+        session.add_message("assistant", answer)
+        
+        return {
+            "question": question,
+            "answer": answer,
+            "citations": [],
+            "images": [],
+            "confidence": "high",
+            "is_smalltalk": True,
         }
 
     # ── Guard: document must be ready ─────────────────────────────────────────
@@ -356,7 +577,7 @@ async def chat(query: Any = Body(...)):
             if status_val == "failed":
                 return {
                     "question": question,
-                    "answer": "Document processing failed. Please re-upload the brochure.",
+                    "answer": "Document processing failed. Please re-upload.",
                     "citations": [], "images": [], "confidence": "low", "status": "failed",
                 }
             progress = doc_status.get("progress", 0)
@@ -372,88 +593,122 @@ async def chat(query: Any = Body(...)):
                 "status": "processing", "progress": progress,
             }
 
-    # ── Intent detection ──────────────────────────────────────────────────────
-    intent = classify_intent(question)
-    image_intent = detect_image_intent(question)
+    # ── Intent override based on Router Node decision ─────────────────────────
+    intent = classify_intent(stand_alone_question)
+    image_intent = detect_image_intent(stand_alone_question)
+
+    if route_decision == "visual_image":
+        intent["requires_visual_response"] = True
+        image_intent["requires_image"] = True
+        logger.info("Visual Query: Routing to Image Retriever Node")
+    else:
+        intent["requires_visual_response"] = False
+        image_intent["requires_image"] = False
+        logger.info("Real Estate Query: Routing to Vector Retriever Node")
+
+    routing_info = None
+    if domain == "excavator":
+        try:
+            from chatbot.query_router import classify_im_query
+            routing_info = classify_im_query(stand_alone_question)
+        except Exception:
+            pass
 
     # ── Try Hybrid RAG ────────────────────────────────────────────────────────
     try:
-        retrieved = retrieve(
-            query=question,
-            document_id=document_id,
-            include_images=include_images or intent.get("requires_visual_response", False),
-            top_k=top_k,
-        )
-        if retrieved:
-            rag_response = generate_grounded_answer(question, retrieved)
-            rag_response["intent"] = {
-                **intent,
-                "requires_image": image_intent["requires_image"],
-                "requires_text": True,
-                "detected_image_types": image_intent.get("detected_types", []),
-            }
-            return rag_response
+        from utils.observability import time_stage
+        with time_stage("total_response_times"):
+            retrieved = retrieve(
+                query=stand_alone_question,
+                document_id=document_id,
+                domain=domain,
+                include_images=include_images or intent.get("requires_visual_response", False),
+                top_k=top_k,
+            )
+            if retrieved:
+                rag_response = generate_grounded_answer(stand_alone_question, retrieved)
+                rag_response["intent"] = {
+                    **intent,
+                    "requires_image": image_intent["requires_image"],
+                    "requires_text": True,
+                    "detected_image_types": image_intent.get("detected_types", []),
+                }
+                if routing_info:
+                    rag_response["routing"] = routing_info
+                    if domain == "excavator" and "answer" in rag_response:
+                        rag_response["answer"] = f"[SCANNED ROUTE: {routing_info['category'].upper()}] - {rag_response['answer']}"
+                
+                # Save RAG response to conversational memory
+                session.add_message("user", question)
+                session.add_message("assistant", rag_response["answer"])
+                
+                return rag_response
     except Exception as exc:
         logger.warning("RAG pipeline failed, falling back to legacy path: %s", exc)
 
     # ── Legacy fallback ───────────────────────────────────────────────────────
-    projects = load_projects(document_id=document_id, include_raw_text=True)
+    projects = load_projects(document_id=document_id, domain=domain, include_raw_text=True)
     if not projects:
-        return {
+        res_dict = {
             "question": question,
             "answer": "No project data found. Please upload a brochure first.",
             "citations": [], "images": [], "confidence": "low", "intent": intent,
         }
+    else:
+        matching_images = []
+        if intent["requires_visual_response"]:
+            matching_images = find_matching_images(
+                question, projects, allowed_image_types=intent.get("image_types", [])
+            )
+        matching_image_paths = [img["image_path"] for img in matching_images]
 
-    matching_images = []
-    if intent["requires_visual_response"]:
-        matching_images = find_matching_images(
-            question, projects, allowed_image_types=intent.get("image_types", [])
-        )
-    matching_image_paths = [img["image_path"] for img in matching_images]
+        local_answer = answer_from_project_data(question, projects)
+        if local_answer is not None:
+            answer = local_answer
+            if intent["requires_visual_response"] and matching_images:
+                if should_prioritize_image(question) or "Data not available" in local_answer:
+                    answer = image_answer_text(question, matching_images) or local_answer
+                else:
+                    answer = f"{local_answer}\n\nRelated image attached."
+            res_dict = {
+                "question": question, "answer": answer,
+                "citations": [], "images": matching_image_paths,
+                "confidence": "medium",
+                "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
+            }
+        elif intent["requires_visual_response"] and matching_images:
+            res_dict = {
+                "question": question,
+                "answer": image_answer_text(question, matching_images),
+                "citations": [], "images": matching_image_paths,
+                "confidence": "medium",
+                "intent": {**intent, "requires_image": True, "requires_text": False},
+            }
+        else:
+            context = json.dumps(build_chat_context(projects, question), indent=2)
+            prompt = (
+                "You are a real estate assistant.\n"
+                "Answer ONLY using the provided data.\n"
+                "If answer not found, say \"Data not available in the uploaded documents.\"\n\n"
+                f"Data:\n{context}\n\n"
+                f"Intent:\n{json.dumps(intent)}\n\n"
+                f"Question:\n{question}\n\nAnswer:"
+            )
+            answer = generate_answer(prompt)
 
-    local_answer = answer_from_project_data(question, projects)
-    if local_answer is not None:
-        answer = local_answer
-        if intent["requires_visual_response"] and matching_images:
-            if should_prioritize_image(question) or "Data not available" in local_answer:
-                answer = image_answer_text(question, matching_images) or local_answer
-            else:
-                answer = f"{local_answer}\n\nRelated image attached."
-        return {
-            "question": question, "answer": answer,
-            "citations": [], "images": matching_image_paths,
-            "confidence": "medium",
-            "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
-        }
+            res_dict = {
+                "question": question, "answer": answer,
+                "citations": [],
+                "images": matching_image_paths if intent["requires_visual_response"] else [],
+                "confidence": "medium",
+                "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
+            }
 
-    if intent["requires_visual_response"] and matching_images:
-        return {
-            "question": question,
-            "answer": image_answer_text(question, matching_images),
-            "citations": [], "images": matching_image_paths,
-            "confidence": "medium",
-            "intent": {**intent, "requires_image": True, "requires_text": False},
-        }
-
-    context = json.dumps(build_chat_context(projects, question), indent=2)
-    prompt = (
-        "You are a real estate assistant.\n"
-        "Answer ONLY using the provided data.\n"
-        "If answer not found, say \"Data not available in the uploaded documents.\"\n\n"
-        f"Data:\n{context}\n\n"
-        f"Intent:\n{json.dumps(intent)}\n\n"
-        f"Question:\n{question}\n\nAnswer:"
-    )
-    answer = generate_answer(prompt)
-
-    return {
-        "question": question, "answer": answer,
-        "citations": [],
-        "images": matching_image_paths if intent["requires_visual_response"] else [],
-        "confidence": "medium",
-        "intent": {**intent, "requires_image": image_intent["requires_image"], "requires_text": True},
-    }
+    if routing_info and isinstance(res_dict, dict):
+        res_dict["routing"] = routing_info
+        if domain == "excavator" and "answer" in res_dict:
+            res_dict["answer"] = f"[SCANNED ROUTE: {routing_info['category'].upper()}] - {res_dict['answer']}"
+    return res_dict
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -491,13 +746,27 @@ async def delete_document(document_id: str):
 
 
 @app.get("/projects")
-async def projects():
-    return {"projects": load_projects()}
+async def projects(domain: str = "real-estate"):
+    return {"projects": load_projects(domain=domain)}
 
 
 @app.get("/builders")
-async def builders():
-    return {"builders": load_builders()}
+async def builders(domain: str = "real-estate"):
+    return {"builders": load_builders(domain=domain)}
+
+
+@app.get("/rag/metrics")
+async def rag_metrics():
+    """Retrieve observability metrics."""
+    from utils.observability import get_observability_metrics
+    return get_observability_metrics()
+
+
+@app.get("/rag/evaluation")
+async def rag_evaluation():
+    """Retrieve evaluation scores and logs."""
+    from utils.evaluation import get_summarized_evaluations
+    return get_summarized_evaluations()
 
 
 # ════════════════════════════════════════════════════════════════════════════════

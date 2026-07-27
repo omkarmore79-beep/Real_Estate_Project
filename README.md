@@ -1,6 +1,7 @@
-# Real Estate Hybrid Multimodal RAG System
+# RAG-as-a-Service Platform (Excavator MVP)
 
-A production-quality document chatbot for real estate brochures, powered by **Hybrid Multimodal RAG** using Qdrant, `BAAI/bge-m3`, `jinaai/jina-clip-v2`, and `BAAI/bge-reranker-large`.
+A production-quality, domain-agnostic document chatbot powered by **Hybrid Multimodal RAG**. 
+Currently configured for the **Hyundai Heavy Machinery (Excavator R215L) MVP** to handle technical troubleshooting, maintenance schedules, and machine diagrams using Qdrant, `BAAI/bge-m3`, `jinaai/jina-clip-v2`, and `BAAI/bge-reranker-large`.
 
 ---
 

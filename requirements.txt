@@ -3,6 +3,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
+tenacity
 
 # ── Database ───────────────────────────────────────────────────────────────────
 pymongo[srv]
@@ -43,3 +44,9 @@ pydantic
 # ── Utilities ─────────────────────────────────────────────────────────────────
 numpy
 
+# ── Enterprise RAG Additions ──────────────────────────────────────────────────
+python-docx
+python-pptx
+openpyxl
+redis
+voyageai

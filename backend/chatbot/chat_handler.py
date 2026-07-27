@@ -245,9 +245,10 @@ def build_chat_context(projects, question):
     for project in projects:
         item = dict(project)
         raw_text = item.pop("raw_text", "")
+        pages_list = item.pop("pages", [])
         item["relevant_text_snippets"] = _extract_relevant_snippets(raw_text, question)
         item["relevant_page_metadata"] = _extract_relevant_pages(
-            item.get("pages", []),
+            pages_list,
             question,
         )
         context.append(item)
@@ -442,9 +443,10 @@ def answer_from_project_data(question, projects):
 
 
 def generate_answer(prompt):
+    from config import LLM_MODEL
     try:
         response = _get_groq_client().chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=LLM_MODEL,
             messages=[
                 {
                     "role": "user",

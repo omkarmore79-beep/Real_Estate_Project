@@ -4,15 +4,6 @@ Grounded Answer Generator.
 Generates answers ONLY from retrieved evidence using the Groq LLM.
 Never uses general knowledge. Every factual claim must be grounded in
 the retrieved context.
-
-Critical real-estate fields that must NEVER be hallucinated:
-  - Price / cost / rate
-  - RERA number / registration ID
-  - Possession / handover date
-  - Carpet area / super built-up area
-  - Legal approvals / NOC
-  - Amenities list
-  - Builder / developer claims
 """
 
 from __future__ import annotations
@@ -23,100 +14,146 @@ import os
 import re
 from typing import Any
 
+from utils.observability import time_stage
+from utils.evaluation import evaluate_rag_response
+
 logger = logging.getLogger(__name__)
 
-# ── Grounding system prompt ────────────────────────────────────────────────────
-_SYSTEM_PROMPT = """You are a strict real estate document analyst.
+# ── Domain-aware system prompts ───────────────────────────────────────────────
+_SYSTEM_PROMPT_EXCAVATOR = """You are an expert Hyundai R215L Excavator Predictive Maintenance Copilot assisting qualified field engineers.
 
-RULES — YOU MUST FOLLOW THESE EXACTLY:
-1. Answer ONLY from the provided retrieved context. Do NOT use any outside knowledge.
-2. If the answer is not present in the retrieved context, respond with:
-   "Data not available in the uploaded documents."
-3. For every factual claim, cite the source (document_id, page number).
-4. NEVER invent or guess: prices, RERA numbers, possession dates, carpet area,
-   super built-up area, legal approvals, amenity lists, or builder claims.
-5. If images are in the context, reference them by image_id and image_type.
-6. Comparison questions: compare ONLY documents present in the retrieved context.
-7. Be concise. Do not add disclaimers unless information is missing.
-8. Use plain language. Do not use markdown headers in your answer.
+DOMAIN: Industrial Heavy Machinery — Hyundai R215L Hydraulic Excavator
+PURPOSE: Fault diagnosis, root cause analysis, troubleshooting, preventive maintenance, and technical document search.
+
+STRICT GROUNDING RULES — FOLLOW EXACTLY:
+1. Answer ONLY from the retrieved context (manuals, service bulletins, maintenance logs, field reports, parts catalog).
+   Do NOT use general mechanical or engineering knowledge not present in the retrieved text.
+2. If the answer cannot be fully supported by the evidence, respond EXACTLY with:
+   "I couldn't find sufficient information in the uploaded manuals for this query."
+3. MANDATORY CITATIONS: For every technical claim (torque specs, clearances, pressures, part numbers, DTC codes,
+   oil grades, intervals), you MUST cite:
+   - Document: [source_file]
+   - Page: [page_number]
+   - Section: [section_path or section]
+   - Figure: [figure_number or image_id] if applicable
+4. DTC CODES: If a fault code appears in context, always explain: code meaning, affected component, probable cause, and recommended corrective action per the manual.
+5. COMPONENT REFERENCES: Use exact Hyundai terminology and part numbers from the retrieved text.
+6. DIAGRAMS: When a diagram or schematic is available in image context, reference it by its Figure number, page, and caption.
+7. SAFETY: Prefix any safety-critical procedure with a ⚠️ WARNING label.
+8. NEVER fabricate, extrapolate, or guess. State when evidence is insufficient.
+9. Structure your response clearly: Diagnosis → Root Cause → Corrective Action → References.
 """
 
-# ── Confidence thresholds ──────────────────────────────────────────────────────
-_HIGH_CONFIDENCE_MIN_CHUNKS = 3
-_MEDIUM_CONFIDENCE_MIN_CHUNKS = 1
+_SYSTEM_PROMPT_GENERIC = """You are an expert technical document analyst and assistant.
 
+RULES — YOU MUST FOLLOW THESE EXACTLY:
+1. Answer ONLY using the provided retrieved context. Do NOT use any external or general knowledge.
+2. If the answer cannot be fully found in the retrieved context with high certainty, respond with EXACTLY:
+   "I couldn't find enough information in the uploaded documents."
+3. For every key claim, reference the source document, page, and section.
+4. NEVER invent, guess, or extrapolate. If details are missing, state that evidence is insufficient.
+5. If images/diagrams are referenced in the context, refer to them by their image_id, page, figure_number, and caption.
+6. Keep responses concise, factual, and strictly grounded.
+"""
+
+# Legacy alias — defaults to generic
+_SYSTEM_PROMPT = _SYSTEM_PROMPT_GENERIC
 
 def generate_grounded_answer(
     question: str,
     retrieved_results: list[dict],
     groq_client=None,
     llm_model: str | None = None,
+    domain: str | None = None,
 ) -> dict:
     """
     Generate a structured grounded answer from retrieved evidence.
-
-    Parameters
-    ----------
-    question:          User's question.
-    retrieved_results: List of result dicts from hybrid_retriever.retrieve().
-    groq_client:       Groq client instance (created lazily if None).
-    llm_model:         Override LLM model name.
-
-    Returns
-    -------
-    dict with keys: question, answer, citations, images, confidence, retrieved_context
+    Uses domain-specific system prompts for excavator vs. real_estate.
     """
     if groq_client is None:
         groq_client = _get_groq_client()
 
     model = llm_model or _get_llm_model()
 
+    # Auto-detect domain from first result if not provided
+    if not domain:
+        for r in retrieved_results:
+            d = r.get("metadata", {}).get("domain") or r.get("domain")
+            if d:
+                domain = d
+                break
+
+    system_prompt = _SYSTEM_PROMPT_EXCAVATOR if domain == "excavator" else _SYSTEM_PROMPT_GENERIC
+
     # ── Separate text and image results ───────────────────────────────────────
-    text_results = [r for r in retrieved_results if r.get("source_type") == "text"]
+    text_results = [r for r in retrieved_results if r.get("source_type") in ("text", "context_window")][:8]
     image_results = [r for r in retrieved_results if r.get("source_type") == "image"]
 
+    # ── Fallback: no retrieved context ─────────────────────────────────────────
+    if not text_results and not image_results:
+        return _insufficient_evidence_response(question, domain)
+
     # ── Confidence assessment ──────────────────────────────────────────────────
-    confidence = _assess_confidence(text_results)
+    primary_text = [r for r in text_results if r.get("source_type") == "text"]
+    confidence = _assess_confidence(primary_text if primary_text else text_results)
+    
+    # If confidence is extremely low (e.g. no high-relevance chunks), abort early
+    if confidence == "low":
+        return _insufficient_evidence_response(question, domain)
 
     # ── Build context string ───────────────────────────────────────────────────
-    context_str = _build_context_string(text_results, image_results)
+    context_str = _build_context_string(text_results, image_results, domain=domain)
 
-    # ── Fallback: no content at all ───────────────────────────────────────────
-    if not context_str.strip():
-        return _no_data_response(question)
-
-    # ── Call LLM ──────────────────────────────────────────────────────────────
+    # ── Call LLM with Observability Timing ─────────────────────────────────────
+    not_found_msg = (
+        "I couldn't find sufficient information in the uploaded manuals for this query."
+        if domain == "excavator"
+        else "I couldn't find enough information in the uploaded documents."
+    )
     user_message = f"""Retrieved Context:
 {context_str}
 
 Question: {question}
 
-Answer based solely on the retrieved context above. Cite document_id and page_number for every key claim. If the answer is not in the context, say: "Data not available in the uploaded documents."
+Answer based solely on the retrieved context above. If the answer is not fully supported, respond with EXACTLY:
+"{not_found_msg}"
 """
 
+    answer_text = ""
     try:
-        response = groq_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,      # low temperature for factual accuracy
-            max_tokens=1024,
-        )
-        answer_text = response.choices[0].message.content.strip()
+        with time_stage("llm_generation_times"):
+            response = groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.05 if domain == "excavator" else 0.1,
+                max_tokens=1536 if domain == "excavator" else 1024,
+            )
+            answer_text = response.choices[0].message.content.strip()
     except Exception as exc:
         logger.error("LLM generation error: %s", exc)
-        answer_text = "Data not available in the uploaded documents."
+        return _insufficient_evidence_response(question, domain)
 
-    # ── Post-process: detect "not available" answers ───────────────────────────
-    if _is_not_found(answer_text):
-        confidence = "low"
-        answer_text = "Data not available in the uploaded documents."
+    # ── Post-process: check for refusal indicators ─────────────────────────────
+    if _is_insufficient(answer_text):
+        return _insufficient_evidence_response(question, domain)
 
     # ── Build citations ────────────────────────────────────────────────────────
     citations = _build_citations(text_results)
     images = _build_image_refs(image_results)
+
+    # ── Run RAG Evaluation on response ─────────────────────────────────────────
+    try:
+        evaluate_rag_response(
+            question=question,
+            answer=answer_text,
+            retrieved_results=retrieved_results,
+            citations=citations
+        )
+    except Exception as exc:
+        logger.debug("Failed to record evaluation metrics: %s", exc)
 
     return {
         "question": question,
@@ -151,15 +188,28 @@ def _get_llm_model() -> str:
 
 
 def _assess_confidence(text_results: list[dict]) -> str:
-    n = len(text_results)
-    if n >= _HIGH_CONFIDENCE_MIN_CHUNKS:
-        return "high"
-    if n >= _MEDIUM_CONFIDENCE_MIN_CHUNKS:
+    """Assess retrieval confidence based on top rerank scores."""
+    if not text_results:
+        return "low"
+    
+    top_score = text_results[0].get("confidence_score", text_results[0].get("score", 0.0))
+    has_reranker = any(r.get("rerank_score") is not None for r in text_results)
+
+    # If using cross-encoder reranker, score is already sigmoid-mapped.
+    if has_reranker:
+        if top_score >= 0.65:
+            return "high"
+        elif top_score >= 0.40:
+            return "medium"
+        return "low"
+
+    # If no reranker was applied, preserve retrieval evidence as medium confidence
+    if top_score > 0:
         return "medium"
     return "low"
 
 
-def _build_context_string(text_results: list[dict], image_results: list[dict]) -> str:
+def _build_context_string(text_results: list[dict], image_results: list[dict], domain: str | None = None) -> str:
     parts: list[str] = []
 
     for i, r in enumerate(text_results[:8]):
@@ -168,9 +218,28 @@ def _build_context_string(text_results: list[dict], image_results: list[dict]) -
         page = r.get("page_number") or meta.get("page_number", "?")
         source = meta.get("source_file", "")
         content = (r.get("content") or "").strip()
-        parts.append(
-            f"[TEXT {i+1}] document_id={doc_id} page={page} file={source}\n{content}"
-        )
+        src_type = r.get("source_type", "text")
+        label = "CONTEXT" if src_type == "context_window" else f"TEXT {i+1}"
+
+        if domain == "excavator":
+            section_path = meta.get("section_path") or meta.get("section", "")
+            dtc_codes = ", ".join(meta.get("dtc_codes") or [])
+            comp_tags = ", ".join(meta.get("component_tags") or [])
+            figure_number = meta.get("figure_number", "")
+            doc_type = meta.get("doc_type", "")
+            version = meta.get("version", "")
+            header = f"[{label}] doc_type={doc_type} version={version} page={page} file={source}"
+            if section_path:
+                header += f" section={section_path}"
+            if comp_tags:
+                header += f" components=[{comp_tags}]"
+            if dtc_codes:
+                header += f" dtc_codes=[{dtc_codes}]"
+            if figure_number:
+                header += f" figure={figure_number}"
+            parts.append(f"{header}\n{content}")
+        else:
+            parts.append(f"[{label}] page={page} file={source}\n{content}")
 
     for i, r in enumerate(image_results[:4]):
         meta = r.get("metadata", {})
@@ -180,17 +249,28 @@ def _build_context_string(text_results: list[dict], image_results: list[dict]) -
         img_type = meta.get("image_type", "image")
         caption = meta.get("caption", "")
         img_path = r.get("image_path") or meta.get("image_path", "")
-        parts.append(
+        figure_number = meta.get("figure_number", "")
+        section_path = meta.get("section_path", "")
+        ocr_labels = meta.get("ocr_labels", "")
+        img_header = (
             f"[IMAGE {i+1}] document_id={doc_id} page={page} image_id={img_id} "
-            f"type={img_type} path={img_path}\nCaption: {caption}"
+            f"type={img_type} path={img_path}"
         )
+        if figure_number:
+            img_header += f" figure={figure_number}"
+        if section_path:
+            img_header += f" section={section_path}"
+        parts.append(f"{img_header}\nCaption: {caption}" + (f"\nOCR: {ocr_labels[:300]}" if ocr_labels else ""))
 
     return "\n\n".join(parts)
 
 
-def _is_not_found(text: str) -> bool:
+def _is_insufficient(text: str) -> bool:
     lower = text.lower()
     markers = (
+        "insufficient evidence",
+        "i couldn't find enough information",
+        "i couldn't find sufficient information",
         "data not available",
         "not found in",
         "not present in",
@@ -199,7 +279,7 @@ def _is_not_found(text: str) -> bool:
         "cannot find",
         "not provided",
     )
-    return any(m in lower for m in markers)
+    return any(m in lower for m in markers) or len(text.strip()) < 10
 
 
 def _build_citations(text_results: list[dict]) -> list[dict]:
@@ -209,6 +289,10 @@ def _build_citations(text_results: list[dict]) -> list[dict]:
         content = (r.get("content") or "").strip()
         ocr_used = bool(r.get("ocr_used", meta.get("ocr_used", False)))
         source_type = r.get("source_type", meta.get("source_type", "pdf_text"))
+        
+        # Extract section
+        section = meta.get("section", meta.get("section_title", "General"))
+        
         citations.append(
             {
                 "citation_id": r.get("citation_id", ""),
@@ -216,13 +300,27 @@ def _build_citations(text_results: list[dict]) -> list[dict]:
                 "source_file": meta.get("source_file", ""),
                 "page_number": r.get("page_number") or meta.get("page_number"),
                 "source_type": source_type,
-                "section": meta.get("section_title", ""),
+                "section": section,
+                "chunk_id": r.get("id", ""),
+                "builder": meta.get("builder", ""),
+                "project": meta.get("project", ""),
+                
+                # Excavator and Multimodal details
+                "doc_type": meta.get("doc_type", ""),
+                "machine_model": meta.get("machine_model", ""),
+                "component_tags": meta.get("component_tags", []),
+                "dtc_codes": meta.get("dtc_codes", []),
+                "section_path": meta.get("section_path", ""),
+                "figure_number": meta.get("figure_number", ""),
+                "image_id": meta.get("image_id", ""),
+                "version": meta.get("version", "1.0"),
+                "hash": meta.get("hash", ""),
+                "timestamp": meta.get("timestamp", ""),
                 "snippet": content[:300] if content else "",
                 "ocr_used": ocr_used,
             }
         )
     return citations
-
 
 
 def _build_image_refs(image_results: list[dict]) -> list[dict]:
@@ -244,15 +342,25 @@ def _build_image_refs(image_results: list[dict]) -> list[dict]:
                 "page_number": r.get("page_number") or meta.get("page_number"),
                 "image_type": meta.get("image_type", "other"),
                 "caption": meta.get("caption", ""),
+                
+                # Additional diagram context
+                "figure_number": meta.get("figure_number", ""),
+                "section": meta.get("section", "General"),
+                "explanation": meta.get("surrounding_explanation", ""),
             }
         )
     return images
 
 
-def _no_data_response(question: str) -> dict:
+def _insufficient_evidence_response(question: str, domain: str | None = None) -> dict:
+    msg = (
+        "I couldn't find sufficient information in the uploaded manuals for this query."
+        if domain == "excavator"
+        else "I couldn't find enough information in the uploaded documents."
+    )
     return {
         "question": question,
-        "answer": "Data not available in the uploaded documents.",
+        "answer": msg,
         "citations": [],
         "images": [],
         "confidence": "low",

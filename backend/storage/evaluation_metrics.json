@@ -1,0 +1,15 @@
+[
+  {
+    "timestamp": "2026-07-10T14:00:07.382470+00:00",
+    "question": "Where is Golden Willows located?",
+    "metrics": {
+      "citation_accuracy": 1.0,
+      "grounding_accuracy": 1.0,
+      "hallucination_rate": 0.0,
+      "mrr": 0.0,
+      "ndcg": 0.0,
+      "average_retrieval_score": 0.0
+    },
+    "_id": "6a50fae7b5731f3843094f86"
+  }
+]
